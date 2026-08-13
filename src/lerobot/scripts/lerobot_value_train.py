@@ -84,7 +84,9 @@ def value_train(
     if accelerator is None:
         from accelerate.utils import DistributedDataParallelKwargs
 
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+        # Pi* value models may leave subsets of parameters unused in a given forward (e.g. frozen
+        # backbones, conditional paths). DDP requires find_unused_parameters=True in that case.
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         force_cpu = cfg.value.device == "cpu"
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
@@ -111,12 +113,10 @@ def value_train(
 
     if is_main_process:
         logging.info("Creating dataset")
-        dataset = make_dataset(cfg)
-
+    # Build dataset on every rank to avoid long rank-0-only initialization causing
+    # other ranks to hit process-group barrier timeout.
+    dataset = make_dataset(cfg)
     accelerator.wait_for_everyone()
-
-    if not is_main_process:
-        dataset = make_dataset(cfg)
 
     if is_main_process:
         logging.info("Creating value model")

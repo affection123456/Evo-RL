@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+from datetime import timedelta
 import logging
 import time
 from contextlib import nullcontext
@@ -178,15 +179,16 @@ def train(
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
-        from accelerate.utils import DistributedDataParallelKwargs
+        from accelerate.utils import DistributedDataParallelKwargs,InitProcessGroupKwargs
 
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when policy.device is set to CPU.
         force_cpu = cfg.policy.device == "cpu"
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
-            kwargs_handlers=[ddp_kwargs],
+            kwargs_handlers=[ddp_kwargs, process_group_kwargs],
             cpu=force_cpu,
         )
 
@@ -296,7 +298,7 @@ def train(
             "normalizer_processor": {
                 "stats": dataset.meta.stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
-                "norm_map": policy.config.normalization_mapping,
+                # "norm_map": policy.config.normalization_mapping,
             },
         }
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
@@ -306,7 +308,7 @@ def train(
             "unnormalizer_processor": {
                 "stats": dataset.meta.stats,
                 "features": policy.config.output_features,
-                "norm_map": policy.config.normalization_mapping,
+                # "norm_map": policy.config.normalization_mapping,
             },
         }
 
