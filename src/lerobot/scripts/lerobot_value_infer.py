@@ -16,6 +16,7 @@
 
 import logging
 import math
+from datetime import timedelta
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -25,7 +26,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 from torch.utils.data import DataLoader, Sampler
 from tqdm.auto import tqdm
 
@@ -40,6 +41,7 @@ from lerobot.scripts.value_infer_viz import (
 )
 from lerobot.utils.constants import (
     CHECKPOINTS_DIR,
+    HF_LEROBOT_HOME,
     LAST_CHECKPOINT_LINK,
     PRETRAINED_MODEL_DIR,
 )
@@ -97,8 +99,13 @@ def _create_accelerator(cfg: ValueInferencePipelineConfig, accelerator: Accelera
         return accelerator
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
     force_cpu = cfg.runtime.device == "cpu"
-    return Accelerator(step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs], cpu=force_cpu)
+    return Accelerator(
+        step_scheduler_with_optimizer=False,
+        kwargs_handlers=[ddp_kwargs, process_group_kwargs],
+        cpu=force_cpu,
+    )
 
 
 def _resolve_pretrained_model_dir(checkpoint_path: str, checkpoint_ref: str) -> Path:
@@ -132,6 +139,10 @@ def _resolve_pretrained_model_dir(checkpoint_path: str, checkpoint_ref: str) -> 
 
 
 def _load_dataset_distributed(cfg: ValueInferencePipelineConfig, accelerator: Accelerator) -> LeRobotDataset:
+    if accelerator.is_main_process:
+        _repair_partial_annotation_schema(cfg)
+    accelerator.wait_for_everyone()
+
     dataset_kwargs = {
         "repo_id": cfg.dataset.repo_id,
         "root": cfg.dataset.root,
@@ -140,12 +151,93 @@ def _load_dataset_distributed(cfg: ValueInferencePipelineConfig, accelerator: Ac
         "download_videos": cfg.dataset.download_videos,
     }
 
-    if accelerator.is_main_process:
-        dataset = LeRobotDataset(**dataset_kwargs)
-    accelerator.wait_for_everyone()
-    if not accelerator.is_main_process:
-        dataset = LeRobotDataset(**dataset_kwargs)
+    dataset = LeRobotDataset(**dataset_kwargs)
     return dataset
+
+
+def _repair_partial_annotation_schema(cfg: ValueInferencePipelineConfig) -> None:
+    # Match LeRobotDataset root resolution so recovery works even when --dataset.root is omitted.
+    dataset_root = Path(cfg.dataset.root) if cfg.dataset.root else HF_LEROBOT_HOME / cfg.dataset.repo_id
+    if not dataset_root.exists():
+        return
+    data_root = dataset_root / "data"
+    if not data_root.is_dir():
+        return
+
+    data_files = sorted(data_root.glob("chunk-*/file-*.parquet"))
+    if not data_files:
+        return
+
+    field_specs: dict[str, dict[str, Any]] = {
+        cfg.acp.value_field: {
+            "dtype": "float32",
+            "np_dtype": np.float32,
+            "pa_type": pa.float32(),
+            "default": np.nan,
+        }
+    }
+    if cfg.acp.enable:
+        field_specs[cfg.acp.advantage_field] = {
+            "dtype": "float32",
+            "np_dtype": np.float32,
+            "pa_type": pa.float32(),
+            "default": np.nan,
+        }
+        field_specs[cfg.acp.indicator_field] = {
+            "dtype": "int64",
+            "np_dtype": np.int64,
+            "pa_type": pa.int64(),
+            "default": 0,
+        }
+
+    present_count = {field: 0 for field in field_specs}
+    schema_names_by_file: dict[Path, set[str]] = {}
+    for parquet_path in data_files:
+        names = set(pq.read_schema(parquet_path).names)
+        schema_names_by_file[parquet_path] = names
+        for field in field_specs:
+            if field in names:
+                present_count[field] += 1
+
+    fields_with_any_data = {field for field, count in present_count.items() if count > 0}
+    if not fields_with_any_data:
+        return
+
+    partial_fields = {
+        field
+        for field in fields_with_any_data
+        if present_count[field] < len(data_files)
+    }
+    if partial_fields:
+        logging.warning(
+            "Detected partial annotation columns from interrupted run; repairing fields %s across %d parquet files.",
+            sorted(partial_fields),
+            len(data_files),
+        )
+        for parquet_path in data_files:
+            existing_names = schema_names_by_file[parquet_path]
+            missing_fields = [field for field in partial_fields if field not in existing_names]
+            if not missing_fields:
+                continue
+
+            table = pq.read_table(parquet_path)
+            for field in missing_fields:
+                spec = field_specs[field]
+                values = np.full(table.num_rows, spec["default"], dtype=spec["np_dtype"])
+                table = table.append_column(field, pa.array(values, type=spec["pa_type"]))
+            pq.write_table(table, parquet_path, compression="snappy")
+
+    info = load_info(dataset_root)
+    info_features = info.setdefault("features", {})
+    info_changed = False
+    for field in fields_with_any_data:
+        if field in info_features:
+            continue
+        info_features[field] = {"dtype": field_specs[field]["dtype"], "shape": (1,), "names": None}
+        info_changed = True
+
+    if info_changed:
+        write_info(info, dataset_root)
 
 
 def _init_runtime(

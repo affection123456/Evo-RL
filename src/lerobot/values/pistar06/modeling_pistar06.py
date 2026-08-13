@@ -129,6 +129,28 @@ def _resolve_load_dtype(dtype_name: str) -> torch.dtype:
     return requested_dtype
 
 
+def _resolve_repo_source(repo_id: str, revision: str | None) -> tuple[str, str | None]:
+    """Resolve model source with local-path priority.
+
+    Priority:
+    1) repo_id is already a local path
+    2) ${MODEL_ZOO}/<repo_id> exists
+    3) fallback to original HF repo_id
+    """
+    local_repo = Path(repo_id).expanduser()
+    if local_repo.exists():
+        return str(local_repo.resolve()), None
+
+    model_zoo = os.getenv("MODEL_ZOO")
+    if model_zoo:
+        local_from_zoo = (Path(model_zoo).expanduser() / repo_id).resolve()
+        if local_from_zoo.exists():
+            logging.info("Resolved '%s' to local MODEL_ZOO path: %s", repo_id, local_from_zoo)
+            return str(local_from_zoo), None
+
+    return repo_id, revision
+
+
 def _freeze_module(module: nn.Module) -> None:
     module.eval()
     for parameter in module.parameters():
@@ -220,34 +242,36 @@ def _load_language_model(
     if AutoConfig is None or AutoModelForCausalLM is None or AutoModel is None:
         raise ImportError("transformers is not installed. Install with `pip install 'lerobot[pi0]'`.")
 
-    model_config = AutoConfig.from_pretrained(repo_id, revision=revision)
+    repo_source, revision = _resolve_repo_source(repo_id, revision)
+
+    model_config = AutoConfig.from_pretrained(repo_source, revision=revision)
     architectures = getattr(model_config, "architectures", None) or []
     prefer_causal_lm = any(isinstance(arch, str) and arch.endswith("ForCausalLM") for arch in architectures)
 
     if prefer_causal_lm:
         lm_with_head, loading_info = AutoModelForCausalLM.from_pretrained(
-            repo_id,
+            repo_source,
             revision=revision,
             torch_dtype=dtype,
             output_loading_info=True,
         )
-        _validate_loading_info(repo_id, "language_model(causal_lm)", loading_info)
+        _validate_loading_info(repo_source, "language_model(causal_lm)", loading_info)
         if not hasattr(lm_with_head, "model"):
             raise RuntimeError(
-                f"AutoModelForCausalLM loaded from '{repo_id}' does not expose `.model` text backbone."
+                f"AutoModelForCausalLM loaded from '{repo_source}' does not expose `.model` text backbone."
             )
         return lm_with_head.model
 
     language_model, loading_info = AutoModel.from_pretrained(
-        repo_id,
+        repo_source,
         revision=revision,
         torch_dtype=dtype,
         output_loading_info=True,
     )
-    _validate_loading_info(repo_id, "language_model(auto_model)", loading_info)
+    _validate_loading_info(repo_source, "language_model(auto_model)", loading_info)
     if not isinstance(language_model, nn.Module):
         raise TypeError(
-            f"AutoModel loaded from '{repo_id}' returned unexpected type: {type(language_model)}."
+            f"AutoModel loaded from '{repo_source}' returned unexpected type: {type(language_model)}."
         )
     return language_model
 
@@ -260,10 +284,11 @@ class Pistar06Model(nn.Module):
 
         self.cfg = cfg
         self.model_dtype = _resolve_load_dtype(cfg.dtype)
+        vision_repo_source, vision_revision = _resolve_repo_source(cfg.vision_repo_id, cfg.vision_revision)
 
         self.vision_encoder = AutoModel.from_pretrained(
-            cfg.vision_repo_id,
-            revision=cfg.vision_revision,
+            vision_repo_source,
+            revision=vision_revision,
             torch_dtype=self.model_dtype,
         )
         self.language_model = _load_language_model(
@@ -273,8 +298,8 @@ class Pistar06Model(nn.Module):
         )
 
         image_processor = AutoImageProcessor.from_pretrained(
-            cfg.vision_repo_id,
-            revision=cfg.vision_revision,
+            vision_repo_source,
+            revision=vision_revision,
             use_fast=True,
         )
         image_height, image_width = _resolve_image_size(image_processor)

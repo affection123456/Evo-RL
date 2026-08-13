@@ -155,6 +155,40 @@ class Pistar06PrepareImagesProcessorStep(ProcessorStep):
     def _process_camera_batch(self, img_batch: Tensor) -> Tensor:
         return self._to_bchw(img_batch).detach().to(dtype=torch.float32)
 
+    @staticmethod
+    def _match_spatial_size(img: Tensor, ref_hw: tuple[int, int]) -> Tensor:
+        """Align [B,C,H,W] to ref (H,W) by center crop / center zero-pad (no resize).
+
+        Example: H 960 -> 720 crops 120 rows from the top and 120 from the bottom.
+        """
+        rh, rw = ref_hw
+        if img.shape[2] == rh and img.shape[3] == rw:
+            return img
+        b, c, h, w = img.shape
+        img = img.float()
+        out = torch.zeros(b, c, rh, rw, device=img.device, dtype=img.dtype)
+
+        if h >= rh:
+            t0 = (h - rh) // 2
+            t1 = t0 + rh
+            dt0, dt1 = 0, rh
+        else:
+            t0, t1 = 0, h
+            dt0 = (rh - h) // 2
+            dt1 = dt0 + h
+
+        if w >= rw:
+            l0 = (w - rw) // 2
+            l1 = l0 + rw
+            dl0, dl1 = 0, rw
+        else:
+            l0, l1 = 0, w
+            dl0 = (rw - w) // 2
+            dl1 = dl0 + w
+
+        out[:, :, dt0:dt1, dl0:dl1] = img[:, :, t0:t1, l0:l1]
+        return out
+
     def _prepare_images(self, observation: dict[str, Any]) -> tuple[Tensor, Tensor]:
         present_img_keys = [key for key in self.camera_features if key in observation]
         if len(present_img_keys) == 0:
@@ -164,6 +198,7 @@ class Pistar06PrepareImagesProcessorStep(ProcessorStep):
             )
 
         reference_img = self._process_camera_batch(torch.as_tensor(observation[present_img_keys[0]]))
+        ref_hw = (int(reference_img.shape[2]), int(reference_img.shape[3]))
         bsize = reference_img.shape[0]
         image_tensors: list[Tensor] = []
         image_masks: list[Tensor] = []
@@ -175,11 +210,12 @@ class Pistar06PrepareImagesProcessorStep(ProcessorStep):
                     raise ValueError(
                         f"Mismatched batch size across cameras. Camera '{key}' has {img.shape[0]}, expected {bsize}."
                     )
-                if img.shape[1:] != reference_img.shape[1:]:
+                if img.shape[1] != reference_img.shape[1]:
                     raise ValueError(
-                        "Camera tensors must share the same [C,H,W] shape before model preprocessing. "
-                        f"Camera '{key}' has {tuple(img.shape[1:])}, expected {tuple(reference_img.shape[1:])}."
+                        "Camera tensors must share the same channel count C before model preprocessing. "
+                        f"Camera '{key}' has C={img.shape[1]}, expected C={reference_img.shape[1]}."
                     )
+                img = self._match_spatial_size(img, ref_hw)
                 image_tensors.append(img)
                 image_masks.append(torch.ones(bsize, dtype=torch.bool))
             else:
