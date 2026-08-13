@@ -100,6 +100,7 @@ pygame-dep = ["pygame>=2.5.1,<2.7.0"]
 placo-dep = ["placo>=0.9.6,<0.10.0"]
 transformers-dep = ["transformers>=4.57.1,<5.0.0"]
 grpcio-dep = ["grpcio==1.73.1", "protobuf>=6.31.1,<6.32.0"]
+policy-infer = ["websockets>=13.0,<16.0"]
 
 # Motors
 feetech = ["feetech-servo-sdk>=1.0.0,<2.0.0"]
@@ -217,6 +218,8 @@ lerobot-value-train="lerobot.scripts.lerobot_value_train:main"
 lerobot-value-infer="lerobot.scripts.lerobot_value_infer:main"
 lerobot-dataset-report="lerobot.scripts.lerobot_dataset_report:main"
 lerobot-export-boundary-frames="lerobot.scripts.lerobot_export_boundary_frames:main"
+lerobot-policy-infer="lerobot.scripts.lerobot_policy_infer:main"
+lerobot-policy-infer-client="lerobot.scripts.lerobot_policy_infer_websocket_client:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.packages.find]
