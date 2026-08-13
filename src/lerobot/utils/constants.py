@@ -89,3 +89,9 @@ LIBERO_KEY_JOINTS_POS = "robot_state/joints/pos"
 LIBERO_KEY_JOINTS_VEL = "robot_state/joints/vel"
 LIBERO_KEY_PIXELS_AGENTVIEW = "pixels/agentview_image"
 LIBERO_KEY_PIXELS_EYE_IN_HAND = "pixels/robot0_eye_in_hand_image"
+
+# ImageNet mean/std in (c, 1, 1) layout; used by `make_dataset` when `use_imagenet_stats=True`.
+IMAGENET_STATS = {
+    "mean": [[[0.485]], [[0.456]], [[0.406]]],
+    "std": [[[0.229]], [[0.224]], [[0.225]]],
+}

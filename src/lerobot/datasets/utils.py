@@ -322,8 +322,16 @@ def cast_stats_to_numpy(stats: dict) -> dict[str, dict[str, np.ndarray]]:
     Returns:
         dict: The statistics dictionary with values cast to numpy arrays.
     """
-    stats = {key: np.array(value) for key, value in flatten_dict(stats).items()}
-    return unflatten_dict(stats)
+    flat: dict[str, np.ndarray] = {}
+    for key, value in flatten_dict(stats).items():
+        arr = np.asarray(value)
+        # Episode tables are often built with `datasets.Dataset.from_generator`, which
+        # requires identical Arrow dtypes across rows. Per-episode stats can mix
+        # bool vs float (e.g. `is_key_frame` min/max) or int vs float (`task_index`).
+        if isinstance(arr, np.ndarray) and arr.dtype.kind in "biuf":
+            arr = arr.astype(np.float64, copy=False)
+        flat[key] = arr
+    return unflatten_dict(flat)
 
 
 def load_stats(local_dir: Path) -> dict[str, dict[str, np.ndarray]] | None:

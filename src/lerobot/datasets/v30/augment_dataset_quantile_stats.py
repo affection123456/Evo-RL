@@ -21,9 +21,9 @@ Most datasets created before the quantile feature was added do not contain
 quantile statistics (q01, q10, q50, q90, q99) in their metadata. This script:
 
 1. Loads an existing LeRobot dataset in v3.0 format
-2. Checks if it already contains quantile statistics
-3. If missing, computes quantile statistics for all features
-4. Updates the dataset metadata with the new quantile statistics
+2. Checks if scalar features already contain quantile statistics
+3. If missing (or with ``--overwrite``), computes quantile statistics for scalar features only
+4. Updates the dataset metadata (image/video pixel stats are not written; use ImageNet at train time)
 
 Usage:
 
@@ -39,7 +39,6 @@ import logging
 from pathlib import Path
 
 import numpy as np
-import torch
 from huggingface_hub import HfApi
 from requests import HTTPError
 from tqdm import tqdm
@@ -50,78 +49,52 @@ from lerobot.datasets.utils import write_stats
 from lerobot.utils.utils import init_logging
 
 
-def has_quantile_stats(stats: dict[str, dict] | None, quantile_list_keys: list[str] | None = None) -> bool:
-    """Check if dataset statistics already contain quantile information.
+def _quantile_list_keys() -> list[str]:
+    return [f"q{int(q * 100):02d}" for q in DEFAULT_QUANTILES]
 
-    Args:
-        stats: Dataset statistics dictionary
 
-    Returns:
-        True if quantile statistics are present, False otherwise
-    """
-    if quantile_list_keys is None:
-        quantile_list_keys = [f"q{int(q * 100):02d}" for q in DEFAULT_QUANTILES]
+def _scalar_feature_keys(features: dict) -> list[str]:
+    return [key for key, ft in features.items() if ft["dtype"] not in ("string", "image", "video")]
 
+
+def needs_scalar_quantile_stats(features: dict, stats: dict[str, dict] | None) -> bool:
+    """Return True if any non-visual feature is missing quantile statistics."""
+    quantile_list_keys = _quantile_list_keys()
     if stats is None:
-        return False
+        return True
 
-    for feature_stats in stats.values():
-        if any(q_key in feature_stats for q_key in quantile_list_keys):
+    for key in _scalar_feature_keys(features):
+        feature_stats = stats.get(key, {})
+        if not any(q_key in feature_stats for q_key in quantile_list_keys):
             return True
 
     return False
 
 
 def process_single_episode(dataset: LeRobotDataset, episode_idx: int) -> dict:
-    """Process a single episode and return its statistics.
+    """Process a single episode and return statistics for non-visual features only.
 
-    Args:
-        dataset: The LeRobot dataset
-        episode_idx: Index of the episode to process
-
-    Returns:
-        Dictionary containing episode statistics
+    Image/video pixel statistics are skipped (training uses ImageNet mean/std at load time).
     """
     logging.info(f"Computing stats for episode {episode_idx}")
 
-    start_idx = dataset.meta.episodes[episode_idx]["dataset_from_index"]
-    end_idx = dataset.meta.episodes[episode_idx]["dataset_to_index"]
+    dataset._ensure_hf_dataset_loaded()
+    start_idx = int(dataset.meta.episodes[episode_idx]["dataset_from_index"])
+    end_idx = int(dataset.meta.episodes[episode_idx]["dataset_to_index"])
+    if start_idx >= end_idx:
+        return {}
 
-    collected_data: dict[str, list] = {}
-    for idx in range(start_idx, end_idx):
-        item = dataset[idx]
-        for key, value in item.items():
-            if key not in dataset.features:
-                continue
-
-            if key not in collected_data:
-                collected_data[key] = []
-            collected_data[key].append(value)
+    scalar_keys = _scalar_feature_keys(dataset.features)
+    batch = dataset.hf_dataset.select(range(start_idx, end_idx))
 
     ep_stats = {}
-    for key, data_list in collected_data.items():
-        if dataset.features[key]["dtype"] == "string":
-            continue
-
-        data = torch.stack(data_list).cpu().numpy()
-        if dataset.features[key]["dtype"] in ["image", "video"]:
-            if data.dtype == np.uint8:
-                data = data.astype(np.float32) / 255.0
-
-            axes_to_reduce = (0, 2, 3)
-            keepdims = True
-        else:
-            axes_to_reduce = 0
-            keepdims = data.ndim == 1
-
+    for key in scalar_keys:
+        col = batch[key]
+        data = np.stack([np.asarray(v) for v in col]) if isinstance(col, list) else np.asarray(col)
+        keepdims = data.ndim == 1
         ep_stats[key] = get_feature_stats(
-            data, axis=axes_to_reduce, keepdims=keepdims, quantile_list=DEFAULT_QUANTILES
+            data, axis=0, keepdims=keepdims, quantile_list=DEFAULT_QUANTILES
         )
-
-        if dataset.features[key]["dtype"] in ["image", "video"]:
-            ep_stats[key] = {
-                k: v if k == "count" else np.squeeze(v, axis=0) for k, v in ep_stats[key].items()
-            }
 
     return ep_stats
 
@@ -140,20 +113,18 @@ def compute_quantile_stats_for_dataset(dataset: LeRobotDataset) -> dict[str, dic
         when video keys are present. For datasets without videos, we use parallel processing
         with ThreadPoolExecutor for better performance.
     """
-    logging.info(f"Computing quantile statistics for dataset with {dataset.num_episodes} episodes")
+    logging.info(
+        f"Computing quantile statistics for dataset with {dataset.num_episodes} episodes "
+        f"(scalar features only; skipping {len(dataset.meta.camera_keys)} camera keys)"
+    )
 
     episode_stats_list = []
-    has_videos = len(dataset.meta.video_keys) > 0
+    max_workers = min(dataset.num_episodes, 16)
 
-    if has_videos:
-        logging.info("Dataset contains video keys - using sequential processing for thread safety")
+    if max_workers <= 1:
         for episode_idx in tqdm(range(dataset.num_episodes), desc="Processing episodes"):
-            ep_stats = process_single_episode(dataset, episode_idx)
-            episode_stats_list.append(ep_stats)
+            episode_stats_list.append(process_single_episode(dataset, episode_idx))
     else:
-        logging.info("Dataset has no video keys - using parallel processing for better performance")
-        max_workers = min(dataset.num_episodes, 16)
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_episode = {
                 executor.submit(process_single_episode, dataset, episode_idx): episode_idx
@@ -164,8 +135,7 @@ def compute_quantile_stats_for_dataset(dataset: LeRobotDataset) -> dict[str, dic
             with tqdm(total=dataset.num_episodes, desc="Processing episodes") as pbar:
                 for future in concurrent.futures.as_completed(future_to_episode):
                     episode_idx = future_to_episode[future]
-                    ep_stats = future.result()
-                    episode_results[episode_idx] = ep_stats
+                    episode_results[episode_idx] = future.result()
                     pbar.update(1)
 
         for episode_idx in range(dataset.num_episodes):
@@ -183,6 +153,7 @@ def augment_dataset_with_quantile_stats(
     repo_id: str,
     root: str | Path | None = None,
     overwrite: bool = False,
+    push_to_hub: bool = False,
 ) -> None:
     """Augment a dataset with quantile statistics if they are missing.
 
@@ -190,18 +161,25 @@ def augment_dataset_with_quantile_stats(
         repo_id: Repository ID of the dataset
         root: Local root directory for the dataset
         overwrite: Overwrite existing quantile statistics if they already exist
+        push_to_hub: Push updated dataset metadata to Hugging Face Hub
     """
-    logging.info(f"Loading dataset: {repo_id}")
+    root_path = Path(root).expanduser().resolve() if root is not None else None
+    # Local datasets under ``--root`` are opened by absolute path; using a Hub-style ``org/name`` as
+    # ``repo_id`` still triggers ``get_safe_version`` → Hub on cache miss (breaks offline). Use the
+    # on-disk folder name as ``repo_id`` when ``root`` is set.
+    load_repo_id = root_path.name if root_path is not None else repo_id
+    logging.info(f"Loading dataset: {repo_id}" + (f" (local root={root_path}, load_repo_id={load_repo_id})" if root_path else ""))
     dataset = LeRobotDataset(
-        repo_id=repo_id,
-        root=root,
+        repo_id=load_repo_id,
+        root=str(root_path) if root_path is not None else None,
+        download_videos=False if root_path is not None else True,
     )
 
-    if not overwrite and has_quantile_stats(dataset.meta.stats):
-        logging.info("Dataset already contains quantile statistics. No action needed.")
+    if not overwrite and not needs_scalar_quantile_stats(dataset.features, dataset.meta.stats):
+        logging.info("Scalar features already contain quantile statistics. No action needed.")
         return
 
-    logging.info("Dataset does not contain quantile statistics. Computing them now...")
+    logging.info("Computing quantile statistics for scalar features...")
 
     new_stats = compute_quantile_stats_for_dataset(dataset)
 
@@ -211,6 +189,10 @@ def augment_dataset_with_quantile_stats(
     write_stats(new_stats, dataset.meta.root)
 
     logging.info("Successfully updated dataset with quantile statistics")
+    if not push_to_hub:
+        logging.info("Local mode enabled: skip push_to_hub.")
+        return
+
     dataset.push_to_hub()
 
     hub_api = HfApi()
@@ -243,6 +225,11 @@ def main():
         action="store_true",
         help="Overwrite existing quantile statistics if they already exist",
     )
+    parser.add_argument(
+        "--push-to-hub",
+        action="store_true",
+        help="Push updated dataset metadata to Hugging Face Hub (default: local-only).",
+    )
 
     args = parser.parse_args()
     root = Path(args.root) if args.root else None
@@ -253,6 +240,7 @@ def main():
         repo_id=args.repo_id,
         root=root,
         overwrite=args.overwrite,
+        push_to_hub=args.push_to_hub,
     )
 
 

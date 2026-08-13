@@ -1652,15 +1652,13 @@ def convert_image_to_video_dataset(
         for ep_idx in episode_indices:
             src_episode = dataset.meta.episodes[ep_idx]
             ep_length = src_episode["length"]
-            ep_meta = {
-                "episode_index": ep_idx,
-                "length": ep_length,
-                "dataset_from_index": cumulative_frame_idx,
-                "dataset_to_index": cumulative_frame_idx + ep_length,
-            }
-            if "data/chunk_index" in src_episode:
-                ep_meta["data/chunk_index"] = src_episode["data/chunk_index"]
-                ep_meta["data/file_index"] = src_episode["data/file_index"]
+            # Keep episode-level metadata unchanged (tasks, success labels, etc.) and only
+            # overwrite fields that must reflect the newly materialized dataset layout.
+            ep_meta = dict(src_episode)
+            ep_meta["episode_index"] = ep_idx
+            ep_meta["length"] = ep_length
+            ep_meta["dataset_from_index"] = cumulative_frame_idx
+            ep_meta["dataset_to_index"] = cumulative_frame_idx + ep_length
             all_episode_metadata[ep_idx] = ep_meta
             cumulative_frame_idx += ep_length
 

@@ -27,12 +27,7 @@ from lerobot.datasets.lerobot_dataset import (
 )
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
-from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
-
-IMAGENET_STATS = {
-    "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
-    "std": [[[0.229]], [[0.224]], [[0.225]]],  # (c,1,1)
-}
+from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
 
 
 def resolve_delta_timestamps(
@@ -126,7 +121,11 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         )
 
     if cfg.dataset.use_imagenet_stats:
+        if dataset.meta.stats is None:
+            dataset.meta.stats = {}
         for key in dataset.meta.camera_keys:
+            if key not in dataset.meta.stats:
+                dataset.meta.stats[key] = {}
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 

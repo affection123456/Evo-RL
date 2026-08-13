@@ -32,12 +32,21 @@ python src/lerobot/datasets/v30/convert_dataset_v21_to_v30.py \
     --repo-id=lerobot/pusht
 ```
 
-Convert a local dataset (works in place):
+Convert a local dataset (default: replaces the source folder with v3.0; the old tree is moved to `*_old`):
 ```bash
 python src/lerobot/datasets/v30/convert_dataset_v21_to_v30.py \
     --repo-id=lerobot/pusht \
     --root=/path/to/local/dataset/directory
     --push-to-hub=false
+```
+
+Keep the v2.1 folder unchanged and write v3.0 beside it as `<dataset_folder_name>_v30`:
+```bash
+python src/lerobot/datasets/v30/convert_dataset_v21_to_v30.py \
+    --repo-id=my_dataset \
+    --root=/path/to/parent_of_dataset_folder \
+    --push-to-hub=false \
+    --keep-original
 ```
 
 """
@@ -221,23 +230,24 @@ def convert_data(root: Path, new_root: Path, data_file_size_in_mb: int):
             "dataset_from_index": num_frames,
             "dataset_to_index": num_frames + ep_num_frames,
         }
-        size_in_mb += ep_size_in_mb
         num_frames += ep_num_frames
         episodes_metadata.append(ep_metadata)
         ep_idx += 1
 
+        paths_to_cat.append(ep_path)
+        size_in_mb += ep_size_in_mb
+
+        # Accumulate episodes into the current output file until the size budget is reached.
+        # (If we flush only when `paths_to_cat` is non-empty but the first episode already exceeds
+        # the budget, we must not increment `file_idx` before the first write — otherwise disk
+        # starts at `file-001` while episode metadata still references `file_index` 0.)
         if size_in_mb < data_file_size_in_mb:
-            paths_to_cat.append(ep_path)
             continue
 
-        if paths_to_cat:
-            concat_data_files(paths_to_cat, new_root, chunk_idx, file_idx, image_keys)
-
-        # Reset for the next file
-        size_in_mb = ep_size_in_mb
-        paths_to_cat = [ep_path]
-
+        concat_data_files(paths_to_cat, new_root, chunk_idx, file_idx, image_keys)
         chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, DEFAULT_CHUNK_SIZE)
+        paths_to_cat = []
+        size_in_mb = 0
 
     # Write remaining data if any
     if paths_to_cat:
@@ -452,6 +462,7 @@ def convert_dataset(
     root: str | Path | None = None,
     push_to_hub: bool = True,
     force_conversion: bool = False,
+    keep_original: bool = False,
 ):
     if data_file_size_in_mb is None:
         data_file_size_in_mb = DEFAULT_DATA_FILE_SIZE_IN_MB
@@ -478,8 +489,8 @@ def convert_dataset(
     old_root = root.parent / f"{root.name}_old"
     new_root = root.parent / f"{root.name}_v30"
 
-    # Handle old_root cleanup if both old_root and root exist
-    if old_root.is_dir() and root.is_dir():
+    # Handle old_root cleanup if both old_root and root exist (in-place workflow only)
+    if not keep_original and old_root.is_dir() and root.is_dir():
         shutil.rmtree(str(root))
         shutil.move(str(old_root), str(root))
 
@@ -500,8 +511,11 @@ def convert_dataset(
     episodes_videos_metadata = convert_videos(root, new_root, video_file_size_in_mb)
     convert_episodes_metadata(root, new_root, episodes_metadata, episodes_videos_metadata)
 
-    shutil.move(str(root), str(old_root))
-    shutil.move(str(new_root), str(root))
+    if keep_original:
+        print(f"Converted v3.0 dataset written to {new_root}. Original v2.1 dataset unchanged at {root}.")
+    else:
+        shutil.move(str(root), str(old_root))
+        shutil.move(str(new_root), str(root))
 
     if push_to_hub:
         hub_api = HfApi()
@@ -518,7 +532,8 @@ def convert_dataset(
         )
         hub_api.create_tag(repo_id, tag=CODEBASE_VERSION, revision=branch, repo_type="dataset")
 
-        LeRobotDataset(repo_id).push_to_hub()
+        push_root = new_root if keep_original else root
+        LeRobotDataset(repo_id, root=str(push_root)).push_to_hub()
 
 
 if __name__ == "__main__":
@@ -565,6 +580,12 @@ if __name__ == "__main__":
         "--force-conversion",
         action="store_true",
         help="Force conversion even if the dataset already has a v3.0 version.",
+    )
+    parser.add_argument(
+        "--keep-original",
+        action="store_true",
+        help="Write v3.0 to a sibling directory named <dataset>_v30 and leave the source v2.1 directory "
+        "unchanged. Default is to replace the source directory and move the old tree to <dataset>_old.",
     )
 
     args = parser.parse_args()
