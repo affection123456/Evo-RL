@@ -61,6 +61,88 @@ from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
 from lerobot.utils.constants import ACTION
 
+PALIGEMMA_TOKENIZER_HUB_ID = "google/paligemma-3b-pt-224"
+
+
+def _is_valid_hf_tokenizer_dir(path: Path) -> bool:
+    return path.is_dir() and (
+        (path / "tokenizer_config.json").exists() or (path / "tokenizer.json").exists()
+    )
+
+
+def resolve_local_paligemma_tokenizer_dir(pretrained: str, tokenizer_path_cli: str | None) -> str | None:
+    """Find a local HF tokenizer directory for pi0/pi05 processors (offline-safe)."""
+    candidates: list[Path] = []
+    if tokenizer_path_cli:
+        candidates.append(Path(tokenizer_path_cli).expanduser())
+    env_p = os.environ.get("LEROBOT_PALIGEMMA_TOKENIZER_PATH")
+    if env_p:
+        candidates.append(Path(env_p).expanduser())
+    if os.path.isdir(pretrained):
+        parent = Path(pretrained).resolve().parent
+        candidates.append(parent.joinpath(*PALIGEMMA_TOKENIZER_HUB_ID.split("/")))
+    model_zoo = os.environ.get("MODEL_ZOO")
+    if model_zoo:
+        candidates.append(Path(model_zoo).expanduser().joinpath(*PALIGEMMA_TOKENIZER_HUB_ID.split("/")))
+
+    seen: set[str] = set()
+    for c in candidates:
+        key = str(c.resolve()) if c.exists() else str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _is_valid_hf_tokenizer_dir(c):
+            return str(c.resolve())
+    return None
+
+
+def ensure_paligemma_tokenizer_uses_local_dir(local_tokenizer_dir: str) -> None:
+    """TokenizerProcessorStep hardcodes Hub id; force resolution to this directory."""
+
+    import lerobot.processor.tokenizer_processor as tp
+
+    orig = tp._resolve_local_pretrained_name
+    local = str(Path(local_tokenizer_dir).resolve())
+
+    def _wrapped(name_or_path: str) -> str:
+        if name_or_path == PALIGEMMA_TOKENIZER_HUB_ID:
+            return local
+        return orig(name_or_path)
+
+    tp._resolve_local_pretrained_name = _wrapped
+
+
+def maybe_set_model_zoo_for_sibling_tokenizer(pretrained: str) -> None:
+    """If checkpoint lives next to google/paligemma-3b-pt-224, set MODEL_ZOO for default Hub-id resolution."""
+    if not os.path.isdir(pretrained):
+        return
+    parent = Path(pretrained).resolve().parent
+    sibling = parent.joinpath(*PALIGEMMA_TOKENIZER_HUB_ID.split("/"))
+    if _is_valid_hf_tokenizer_dir(sibling):
+        os.environ.setdefault("MODEL_ZOO", str(parent))
+
+
+def normalize_openpi_checkpoint_json(config: dict[str, Any]) -> dict[str, Any]:
+    """Map OpenPI-exported `config.json` keys into LeRobot PI0/PI05 config names."""
+    out = dict(config)
+    if "action_horizon" in out:
+        ah = int(out.pop("action_horizon"))
+        out.setdefault("chunk_size", ah)
+        out.setdefault("n_action_steps", ah)
+    if "action_dim" in out:
+        ad = int(out.pop("action_dim"))
+        out.setdefault("max_action_dim", ad)
+        out.setdefault("max_state_dim", ad)
+    if "precision" in out:
+        prec = str(out.pop("precision")).lower()
+        if prec in ("bfloat16", "bf16"):
+            out.setdefault("dtype", "bfloat16")
+        elif prec in ("float32", "fp32", "float"):
+            out.setdefault("dtype", "float32")
+        else:
+            out.setdefault("dtype", prec)
+    return out
+
 
 def extract_normalization_stats(state_dict: dict[str, torch.Tensor]) -> dict[str, dict[str, torch.Tensor]]:
     """
@@ -500,28 +582,48 @@ def main():
         default=None,
         help="Git branch to use when pushing to hub. If specified, a PR will be created automatically (default: push directly to main)",
     )
+    parser.add_argument(
+        "--policy-type",
+        type=str,
+        default=None,
+        help="When config.json has no 'type' (OpenPI exports), set e.g. pi05 or pi0.",
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        default=None,
+        help=(
+            "Local directory with PaliGemma tokenizer (tokenizer_config.json / tokenizer.json). "
+            "If omitted, uses $LEROBOT_PALIGEMMA_TOKENIZER_PATH, $MODEL_ZOO/google/paligemma-3b-pt-224, "
+            "or <checkpoint-parent>/google/paligemma-3b-pt-224."
+        ),
+    )
 
     args = parser.parse_args()
 
-    # Load model and config
-    print(f"Loading model from {args.pretrained_path}...")
-    if os.path.isdir(args.pretrained_path):
-        # Local directory
-        state_dict = load_safetensors(os.path.join(args.pretrained_path, "model.safetensors"))
-        with open(os.path.join(args.pretrained_path, "config.json")) as f:
-            config = json.load(f)
+    pretrained = os.path.expanduser(args.pretrained_path)
 
-        # Try to load train_config (optional)
+    # Load model and config
+    print(f"Loading model from {pretrained}...")
+    if os.path.isdir(pretrained):
+        state_dict = load_safetensors(os.path.join(pretrained, "model.safetensors"))
+        with open(os.path.join(pretrained, "config.json")) as f:
+            config = normalize_openpi_checkpoint_json(json.load(f))
+
         train_config = None
-        train_config_path = os.path.join(args.pretrained_path, "train_config.json")
+        train_config_path = os.path.join(pretrained, "train_config.json")
         if os.path.exists(train_config_path):
             with open(train_config_path) as f:
                 train_config = json.load(f)
         else:
             print("train_config.json not found - continuing without training configuration")
+    elif os.path.isabs(pretrained) or pretrained.startswith(("./", "../")):
+        raise FileNotFoundError(
+            f"Local pretrained directory does not exist or is not a directory: {pretrained}"
+        )
     else:
-        # Hub repository
         state_dict, config, train_config = load_model_from_hub(args.pretrained_path, args.revision)
+        config = normalize_openpi_checkpoint_json(config)
 
     # Extract normalization statistics
     print("Extracting normalization statistics...")
@@ -549,24 +651,31 @@ def main():
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
-        if os.path.isdir(args.pretrained_path):
-            output_dir = Path(args.pretrained_path).parent / f"{Path(args.pretrained_path).name}_migrated"
+        if os.path.isdir(pretrained):
+            output_dir = Path(pretrained).parent / f"{Path(pretrained).name}_migrated"
         else:
             output_dir = Path(f"./{args.pretrained_path.replace('/', '_')}_migrated")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract policy type from config
+    # Policy type (OpenPI configs often omit `type`; user adds pi05 manually or passes --policy-type)
     if "type" not in config:
-        raise ValueError("Policy type not found in config.json. The config must contain a 'type' field.")
+        if not args.policy_type:
+            raise ValueError(
+                "Policy type not found in config.json. For OpenPI-style checkpoints use "
+                "--policy-type pi05 (or add \"type\": \"pi05\" to config.json)."
+            )
+        config["type"] = args.policy_type
+        print(f"Using policy type from --policy-type: {args.policy_type}")
 
     policy_type = config["type"]
     print(f"Detected policy type: {policy_type}")
 
-    # Clean up config - remove fields that shouldn't be passed to config constructor
-    cleaned_config = dict(config)
+    # Strip OpenPI-only keys again, then remove registry-only fields before dataclass ctor
+    cleaned_config = normalize_openpi_checkpoint_json(dict(config))
+    for legacy in ("action_dim", "action_horizon", "precision"):
+        cleaned_config.pop(legacy, None)
 
-    # Remove fields that are not part of the config class constructors
     fields_to_remove = ["normalization_mapping", "type"]
     for field in fields_to_remove:
         if field in cleaned_config:
@@ -610,6 +719,25 @@ def main():
     )
     policy.to(torch.float32)
     # Create preprocessor and postprocessor using the factory
+    maybe_set_model_zoo_for_sibling_tokenizer(pretrained)
+    if policy_type in ("pi0", "pi05"):
+        paligemma_local = resolve_local_paligemma_tokenizer_dir(pretrained, args.tokenizer_path)
+        if paligemma_local:
+            ensure_paligemma_tokenizer_uses_local_dir(paligemma_local)
+            print(f"Using local PaliGemma tokenizer (offline): {paligemma_local}")
+        elif os.path.isdir(pretrained):
+            raise FileNotFoundError(
+                "Local pi0/pi05 checkpoint migration requires a local PaliGemma tokenizer snapshot "
+                "(Hub is not used for tokenizer when migrating from a local directory).\n"
+                "Provide one of:\n"
+                "  --tokenizer-path /path/to/paligemma-3b-pt-224\n"
+                "  export LEROBOT_PALIGEMMA_TOKENIZER_PATH=...\n"
+                "  export MODEL_ZOO=parent-dir-so-that-$MODEL_ZOO/google/paligemma-3b-pt-224 exists\n"
+                f"  Or: {Path(pretrained).resolve().parent.joinpath(*PALIGEMMA_TOKENIZER_HUB_ID.split('/'))}\n"
+                "Download example (on a networked machine):\n"
+                "  huggingface-cli download google/paligemma-3b-pt-224 --local-dir <DIR>"
+            )
+
     print("Creating preprocessor and postprocessor using make_pre_post_processors...")
     preprocessor, postprocessor = make_pre_post_processors(policy_cfg=policy_config, dataset_stats=stats)
 

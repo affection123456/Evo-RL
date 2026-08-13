@@ -264,7 +264,11 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             files("lerobot.templates").joinpath("lerobot_modelcard_template.md").read_text(encoding="utf-8")
         )
         card = ModelCard.from_template(card_data, template_str=template_card)
-        card.validate()
+        try:
+            card.validate()
+        except OSError as exc:
+            # validate() hits https://huggingface.co/api/validate-yaml; skip when offline / no route.
+            logging.warning("Skipping remote model card YAML validation: %s", exc)
         return card
 
     def wrap_with_peft(

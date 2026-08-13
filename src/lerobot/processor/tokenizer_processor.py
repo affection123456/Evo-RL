@@ -24,7 +24,9 @@ token IDs and attention masks, which are then added to the observation dictionar
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -49,6 +51,22 @@ if TYPE_CHECKING or _transformers_available:
 else:
     AutoProcessor = None
     AutoTokenizer = None
+
+
+def _resolve_local_pretrained_name(name_or_path: str) -> str:
+    """Resolve pretrained name with local MODEL_ZOO priority."""
+    candidate = Path(name_or_path).expanduser()
+    if candidate.exists():
+        return str(candidate.resolve())
+
+    model_zoo = os.getenv("MODEL_ZOO")
+    if model_zoo:
+        local_from_zoo = (Path(model_zoo).expanduser() / name_or_path).resolve()
+        if local_from_zoo.exists():
+            logging.info("Resolved tokenizer/processor '%s' to local MODEL_ZOO path: %s", name_or_path, local_from_zoo)
+            return str(local_from_zoo)
+
+    return name_or_path
 
 
 @dataclass
@@ -108,7 +126,8 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         elif self.tokenizer_name is not None:
             if AutoTokenizer is None:
                 raise ImportError("AutoTokenizer is not available")
-            self.input_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+            tokenizer_source = _resolve_local_pretrained_name(self.tokenizer_name)
+            self.input_tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
         else:
             raise ValueError(
                 "Either 'tokenizer' or 'tokenizer_name' must be provided. "
@@ -376,8 +395,9 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
         elif self.action_tokenizer_name is not None:
             if AutoProcessor is None:
                 raise ImportError("AutoProcessor is not available")
+            action_tokenizer_source = _resolve_local_pretrained_name(self.action_tokenizer_name)
             self.action_tokenizer = AutoProcessor.from_pretrained(
-                self.action_tokenizer_name, trust_remote_code=self.trust_remote_code
+                action_tokenizer_source, trust_remote_code=self.trust_remote_code
             )
         else:
             raise ValueError(
@@ -385,8 +405,9 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
                 "Pass a tokenizer object directly or a tokenizer name to auto-load."
             )
 
+        paligemma_tokenizer_source = _resolve_local_pretrained_name(self.paligemma_tokenizer_name)
         self._paligemma_tokenizer = AutoTokenizer.from_pretrained(
-            self.paligemma_tokenizer_name,
+            paligemma_tokenizer_source,
             trust_remote_code=self.trust_remote_code,
             add_eos_token=True,
             add_bos_token=False,
