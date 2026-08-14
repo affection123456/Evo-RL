@@ -112,3 +112,74 @@ evo_rl_apply_preset() {
     echo "[preset] DATASET_ROOT=${DATASET_ROOT}"
   fi
 }
+
+evo_rl_validate_output_dir() {
+  local repo_root="${1:?repository root is required}"
+  local output_dir="${2-}"
+  local outputs_root candidate home_root
+
+  if [[ -z "${output_dir}" ]]; then
+    echo "ERROR: OUTPUT_DIR must not be empty." >&2
+    return 1
+  fi
+  repo_root="$(realpath -e -- "${repo_root}")"
+  outputs_root="$(realpath -m -- "${repo_root}/outputs")"
+  if [[ "${output_dir}" == /* ]]; then
+    candidate="$(realpath -m -- "${output_dir}")"
+  else
+    candidate="$(realpath -m -- "${repo_root}/${output_dir}")"
+  fi
+  home_root=""
+  if [[ -n "${HOME:-}" ]]; then
+    home_root="$(realpath -m -- "${HOME}")"
+  fi
+
+  if [[ "${output_dir}" == "." || "${candidate}" == "/" || "${candidate}" == "${repo_root}" \
+    || "${candidate}" == "${outputs_root}" || ( -n "${home_root}" && "${candidate}" == "${home_root}" ) \
+    || "${candidate}" != "${outputs_root}/"* ]]; then
+    echo "ERROR: refusing unsafe OUTPUT_DIR='${output_dir}'; use a child of '${outputs_root}'." >&2
+    return 1
+  fi
+  printf '%s\n' "${candidate}"
+}
+
+evo_rl_configure_gpus() {
+  GPU_ID_LIST="${GPU_ID_LIST:-0}"
+  USE_MULTI_GPU="${USE_MULTI_GPU:-0}"
+
+  if [[ ! "${GPU_ID_LIST}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "ERROR: --gpu-id-list must be a comma-separated list of numeric GPU IDs." >&2
+    return 1
+  fi
+  local -a gpu_ids
+  local gpu_id seen=","
+  IFS=',' read -r -a gpu_ids <<< "${GPU_ID_LIST}"
+  for gpu_id in "${gpu_ids[@]}"; do
+    if [[ "${seen}" == *",${gpu_id},"* ]]; then
+      echo "ERROR: --gpu-id-list contains duplicate GPU ID '${gpu_id}'." >&2
+      return 1
+    fi
+    seen+="${gpu_id},"
+  done
+
+  if [[ -z "${NUM_GPUS:-}" ]]; then
+    NUM_GPUS="${#gpu_ids[@]}"
+  elif [[ ! "${NUM_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: --num-gpus must be a positive integer." >&2
+    return 1
+  fi
+  if [[ "${USE_MULTI_GPU}" != "0" && "${USE_MULTI_GPU}" != "1" ]]; then
+    echo "ERROR: --use-multi-gpu must be 0 or 1." >&2
+    return 1
+  fi
+  if [[ "${USE_MULTI_GPU}" == "1" ]]; then
+    if [[ "${#gpu_ids[@]}" -lt 2 ]]; then
+      echo "ERROR: multi-GPU mode requires at least two GPU IDs." >&2
+      return 1
+    fi
+    if [[ "${NUM_GPUS}" -ne "${#gpu_ids[@]}" ]]; then
+      echo "ERROR: NUM_GPUS=${NUM_GPUS} does not match ${#gpu_ids[@]} selected GPU IDs (${GPU_ID_LIST})." >&2
+      return 1
+    fi
+  fi
+}

@@ -43,15 +43,18 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs/value_train/${RUN_NAME}}"
 JOB_NAME="${JOB_NAME:-${RUN_NAME}.value_train}"
 WANDB_ENABLE="${WANDB_ENABLE:-true}"
 PI05_RENAME_MAP='{"ee_state":"observation.state","observation.ee_state":"observation.state","top_head":"observation.images.top_head","hand_right":"observation.images.hand_right","hand_left":"observation.images.hand_left"}'
+OUTPUT_DIR="$(evo_rl_validate_output_dir "${REPO_ROOT}" "${OUTPUT_DIR}")"
+VALUE_STEPS_ARGS=()
+if [[ -n "${STEPS:-}" ]]; then
+  VALUE_STEPS_ARGS+=("--steps=${STEPS}")
+fi
 
 if [[ -d "${OUTPUT_DIR}" ]]; then
   echo "Output dir exists, removing: ${OUTPUT_DIR}"
   rm -rf "${OUTPUT_DIR}"
 fi
 
-NUM_GPUS="${NUM_GPUS:-1}"
-GPU_ID_LIST="${GPU_ID_LIST:-0}"
-USE_MULTI_GPU="${USE_MULTI_GPU:-0}"
+evo_rl_configure_gpus
 COMMON_ARGS=(
   "--dataset.repo_id=${DATASET_REPO_ID}"
   "--dataset.root=${DATASET_ROOT}"
@@ -61,6 +64,7 @@ COMMON_ARGS=(
   "--value.repo_id=${VALUE_REPO_ID}"
   "--batch_size=${BATCH_SIZE}"
   "--num_workers=${NUM_WORKERS}"
+  "${VALUE_STEPS_ARGS[@]}"
   "--log_freq=${LOG_FREQ}"
   "--save_checkpoint=${SAVE_CHECKPOINT}"
   "--output_dir=${OUTPUT_DIR}"

@@ -46,6 +46,7 @@ ACP_INDICATOR_DROPOUT="${ACP_INDICATOR_DROPOUT:-0.3}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/train/${RUN_NAME}}"
 JOB_NAME="${JOB_NAME:-${RUN_NAME}.policy_train}"
 WANDB_ENABLE="${WANDB_ENABLE:-true}"
+OUTPUT_DIR="$(evo_rl_validate_output_dir "${REPO_ROOT}" "${OUTPUT_DIR}")"
 
 DATASET_ARGS=(
   "--dataset.repo_id=${DATASET_REPO_ID}"
@@ -68,9 +69,7 @@ if [[ -d "${OUTPUT_DIR}" ]]; then
   rm -rf "${OUTPUT_DIR}"
 fi
 
-NUM_GPUS="${NUM_GPUS:-1}"
-GPU_ID_LIST="${GPU_ID_LIST:-0}"
-USE_MULTI_GPU="${USE_MULTI_GPU:-0}"
+evo_rl_configure_gpus
 COMMON_ARGS=(
   "${DATASET_ARGS[@]}"
   "${POLICY_ARGS[@]}"

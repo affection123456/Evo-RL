@@ -45,15 +45,14 @@ ACP_IND_FIELD="${ACP_IND_FIELD:-complementary_info.acp_indicator_${TAG}}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/value_infer/${RUN_NAME}}"
 JOB_NAME="${JOB_NAME:-${RUN_NAME}.infer}"
 PI05_RENAME_MAP='{"ee_state":"observation.state","observation.ee_state":"observation.state","top_head":"observation.images.top_head","hand_right":"observation.images.hand_right","hand_left":"observation.images.hand_left"}'
+OUTPUT_DIR="$(evo_rl_validate_output_dir "${REPO_ROOT}" "${OUTPUT_DIR}")"
 
 if [[ -d "${OUTPUT_DIR}" ]]; then
   echo "Output dir exists, removing: ${OUTPUT_DIR}"
   rm -rf "${OUTPUT_DIR}"
 fi
 
-NUM_GPUS="${NUM_GPUS:-1}"
-GPU_ID_LIST="${GPU_ID_LIST:-0}"
-USE_MULTI_GPU="${USE_MULTI_GPU:-0}"
+evo_rl_configure_gpus
 COMMON_ARGS=(
   "--dataset.repo_id=${DATASET_REPO_ID}"
   "--dataset.root=${DATASET_ROOT}"

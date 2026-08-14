@@ -69,25 +69,44 @@ _require_sources() {
   fi
 }
 
-_sources_are_v30() {
+_classify_source_versions() {
   local source version
+  local v21_count=0
+  local v30_count=0
   for source in "${SOURCES_ARR[@]}"; do
     if [[ ! -f "${SOURCE_DIR}/${source}/meta/info.json" ]]; then
+      echo "ERROR: missing source metadata: ${SOURCE_DIR}/${source}/meta/info.json" >&2
       return 1
     fi
     version="$("${PYTHON}" -c 'import json, sys; print(json.load(open(sys.argv[1])).get("codebase_version", ""))' \
       "${SOURCE_DIR}/${source}/meta/info.json")"
-    if [[ "${version}" != "v3.0" ]]; then
-      return 1
-    fi
+    case "${version}" in
+      v2.1) ((v21_count += 1)) ;;
+      v3.0) ((v30_count += 1)) ;;
+      *)
+        echo "ERROR: unsupported codebase_version='${version}' for source '${source}'." >&2
+        return 1
+        ;;
+    esac
   done
+  if [[ "${v21_count}" -gt 0 && "${v30_count}" -gt 0 ]]; then
+    echo "ERROR: mixed v2.1/v3.0 sources are unsafe; convert v2.1 sources first, then merge only v3.0 sources." >&2
+    return 1
+  fi
+  if [[ "${v30_count}" -gt 0 ]]; then
+    printf 'v3.0\n'
+  else
+    printf 'v2.1\n'
+  fi
 }
 
 _convert() {
   local merge="$1"
   _require_sources
+  local source_version
+  source_version="$(_classify_source_versions)"
   local skip_convert="${SKIP_CONVERT:-0}"
-  if [[ "${skip_convert}" != "1" ]] && _sources_are_v30; then
+  if [[ "${source_version}" == "v3.0" ]]; then
     skip_convert=1
     echo "Sources are already v3.0; using merge-only mode."
   fi
@@ -122,10 +141,8 @@ _convert_v30_img2video() {
     "--operation.type=convert_image_to_video"
     "--operation.vcodec=h264"
     "--operation.num_workers=${IMG2VIDEO_WORKERS:-16}"
+    "--root=${LOCAL_ROOT}"
   )
-  if [[ -n "${IMG2VIDEO_ROOT:-}" ]]; then
-    cmd+=("--root=${IMG2VIDEO_ROOT}")
-  fi
   "${cmd[@]}"
 }
 
@@ -146,8 +163,7 @@ _report() {
     exit 1
   fi
   "${PYTHON}" -m lerobot.scripts.lerobot_dataset_report \
-    --dataset "${DATASET_REPO_ID}" \
-    --root "${HF_ROOT}"
+    --dataset "${LOCAL_ROOT}"
 }
 
 case "${STEP}" in
