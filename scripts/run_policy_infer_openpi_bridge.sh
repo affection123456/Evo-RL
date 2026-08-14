@@ -25,7 +25,11 @@ evo_rl_apply_preset
 
 export MODEL_ZOO="${MODEL_ZOO:-/mnt/data/modelzoo}"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}:/mnt/nas/${USR_NAME}/openpi_05/openpi/src:/mnt/nas/${USR_NAME}/openpi_05/openpi/packages/openpi-client/src:${PYTHONPATH:-}"
+OPENPI_ROOT="${OPENPI_ROOT:-/mnt/nas/${USR_NAME}/project/openpi}"
+if [[ ! -d "${OPENPI_ROOT}/src/openpi" && -d "/mnt/nas/${USR_NAME}/openpi_05/openpi/src/openpi" ]]; then
+  OPENPI_ROOT="/mnt/nas/${USR_NAME}/openpi_05/openpi"
+fi
+export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}:${OPENPI_ROOT}/src:${OPENPI_ROOT}/packages/openpi-client/src:${PYTHONPATH:-}"
 PYTHON="${PYTHON:-/mnt/data/miniconda3/envs/evo-rl_${USR_NAME}/bin/python}"
 
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-outputs/train/${RUN_NAME}/checkpoints/last}"

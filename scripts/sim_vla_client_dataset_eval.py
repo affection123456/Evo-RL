@@ -29,6 +29,13 @@ import websockets.sync.client
 from openpi_client import msgpack_numpy
 
 
+def _get_first(sample: dict, *keys: str):
+    for key in keys:
+        if key in sample and sample[key] is not None:
+            return sample[key]
+    raise KeyError(f"none of the dataset keys are present: {keys}")
+
+
 def _as_hwc_uint8(img: np.ndarray) -> np.ndarray:
     x = np.asarray(img)
     if x.ndim == 3 and x.shape[0] in (1, 3):
@@ -46,17 +53,27 @@ def _quat_angle_deg(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def _pack_obs(sample: dict, prompt: str, *, include_left: bool = True) -> dict:
-    ee = np.asarray(sample["ee_state"], dtype=np.float32).reshape(-1)
-    top = _as_hwc_uint8(sample["top_head"])
-    right = _as_hwc_uint8(sample["hand_right"])
+    ee = np.asarray(
+        _get_first(sample, "ee_state", "observation.ee_state", "observation.state"),
+        dtype=np.float32,
+    ).reshape(-1)
+    top = _as_hwc_uint8(_get_first(sample, "top_head", "observation.images.top_head"))
+    right = _as_hwc_uint8(
+        _get_first(sample, "hand_right", "observation.images.hand_right")
+    )
     out = {
         "observation/state": ee,
         "observation/image": top,
         "observation/right_wrist_image": right,
         "prompt": prompt,
     }
-    if include_left and "hand_left" in sample:
-        out["observation/left_wrist_image"] = _as_hwc_uint8(sample["hand_left"])
+    if include_left:
+        try:
+            left = _get_first(sample, "hand_left", "observation.images.hand_left")
+        except KeyError:
+            left = None
+        if left is not None:
+            out["observation/left_wrist_image"] = _as_hwc_uint8(left)
     return out
 
 
@@ -262,9 +279,17 @@ def main() -> int:
             gt_rows = []
             for j in range(args.chunk_size):
                 row = ds[idx + j]
-                gt_rows.append(np.asarray(row["ee_actions"], dtype=np.float32).reshape(-1))
+                gt_rows.append(
+                    np.asarray(
+                        _get_first(row, "ee_actions", "observation.ee_actions", "action"),
+                        dtype=np.float32,
+                    ).reshape(-1)
+                )
             gt = np.stack(gt_rows, axis=0)
-            state = np.asarray(sample["ee_state"], dtype=np.float32).reshape(-1)
+            state = np.asarray(
+                _get_first(sample, "ee_state", "observation.ee_state", "observation.state"),
+                dtype=np.float32,
+            ).reshape(-1)
 
             sample_prompt = (
                 str(sample["task"]) if ("task" in sample and sample["task"]) else prompt
@@ -272,9 +297,15 @@ def main() -> int:
             obs = _pack_obs(
                 {
                     "ee_state": state,
-                    "top_head": sample["top_head"],
-                    "hand_right": sample["hand_right"],
-                    "hand_left": sample.get("hand_left"),
+                    "top_head": _get_first(
+                        sample, "top_head", "observation.images.top_head"
+                    ),
+                    "hand_right": _get_first(
+                        sample, "hand_right", "observation.images.hand_right"
+                    ),
+                    "hand_left": sample.get(
+                        "hand_left", sample.get("observation.images.hand_left")
+                    ),
                 },
                 sample_prompt,
                 include_left=True,
