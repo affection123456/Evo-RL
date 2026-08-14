@@ -176,6 +176,31 @@ def _repair_partial_annotation_schema(cfg: ValueInferencePipelineConfig) -> None
             "default": np.nan,
         }
     }
+    if cfg.acp.emit_ref_stage:
+        field_specs[cfg.acp.ref_stage_field] = {
+            "dtype": "string",
+            "np_dtype": object,
+            "pa_type": pa.string(),
+            "default": "",
+        }
+        field_specs[cfg.acp.ref_stage_index_field] = {
+            "dtype": "int64",
+            "np_dtype": np.int64,
+            "pa_type": pa.int64(),
+            "default": 0,
+        }
+        field_specs[cfg.acp.ref_stage_progress_field] = {
+            "dtype": "float32",
+            "np_dtype": np.float32,
+            "pa_type": pa.float32(),
+            "default": np.nan,
+        }
+        field_specs[cfg.acp.ref_stage_value_field] = {
+            "dtype": "float32",
+            "np_dtype": np.float32,
+            "pa_type": pa.float32(),
+            "default": np.nan,
+        }
     if cfg.acp.enable:
         field_specs[cfg.acp.advantage_field] = {
             "dtype": "float32",
@@ -368,6 +393,70 @@ def _compute_n_step_advantages(
     return advantages
 
 
+def _compute_ref_stage_outputs(
+    episode_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    is_key_frame: np.ndarray,
+    values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute stage text/progress from keyframe pairs within each episode."""
+    if not (episode_indices.shape == frame_indices.shape == is_key_frame.shape == values.shape):
+        raise ValueError("episode_indices, frame_indices, is_key_frame and values must have identical shapes.")
+
+    n = episode_indices.shape[0]
+    stage_text = np.empty(n, dtype=object)
+    stage_progress = np.zeros(n, dtype=np.float32)
+    stage_value = values.astype(np.float32, copy=True)
+
+    unique_episodes = np.unique(episode_indices.astype(np.int64, copy=False))
+    for ep in unique_episodes:
+        ep_mask = episode_indices == ep
+        ep_row_indices = np.where(ep_mask)[0]
+        ep_frame_indices = frame_indices[ep_mask].astype(np.int64, copy=False)
+        ep_key_flags = is_key_frame[ep_mask].astype(np.bool_, copy=False)
+
+        if ep_row_indices.size == 0:
+            continue
+
+        # Sort episode rows by frame index for stable segmentation.
+        order = np.argsort(ep_frame_indices, kind="stable")
+        ep_row_indices = ep_row_indices[order]
+        ep_frame_indices = ep_frame_indices[order]
+        ep_key_flags = ep_key_flags[order]
+
+        key_frames = np.unique(ep_frame_indices[ep_key_flags]).astype(np.int64, copy=False)
+
+        # Requirement: one stage between every two keyframes.
+        # Fallback: if fewer than 2 keyframes, keep one single stage for the episode.
+        if key_frames.size < 2:
+            start = int(ep_frame_indices[0])
+            end = int(ep_frame_indices[-1])
+            denom = max(end - start, 1)
+            for row_idx, fi in zip(ep_row_indices, ep_frame_indices, strict=True):
+                stage_text[row_idx] = "stage_00"
+                stage_progress[row_idx] = np.float32(min(max((int(fi) - start) / denom, 0.0), 1.0))
+            continue
+
+        # Build segments from keyframe pairs: [k0, k1], [k1, k2], ...
+        for row_idx, fi in zip(ep_row_indices, ep_frame_indices, strict=True):
+            fi_int = int(fi)
+            if fi_int <= int(key_frames[0]):
+                stage_idx = 0
+            elif fi_int >= int(key_frames[-1]):
+                stage_idx = int(key_frames.size - 2)
+            else:
+                stage_idx = int(np.searchsorted(key_frames, fi_int, side="right") - 1)
+                stage_idx = min(max(stage_idx, 0), int(key_frames.size - 2))
+
+            seg_start = int(key_frames[stage_idx])
+            seg_end = int(key_frames[stage_idx + 1])
+            denom = max(seg_end - seg_start, 1)
+            stage_text[row_idx] = f"stage_{stage_idx:02d}"
+            stage_progress[row_idx] = np.float32(min(max((fi_int - seg_start) / denom, 0.0), 1.0))
+
+    return stage_text, stage_progress, stage_value
+
+
 def _compute_task_thresholds(
     task_indices: np.ndarray,
     advantages: np.ndarray,
@@ -436,9 +525,20 @@ def _write_columns_in_place(
 
     lookups: dict[str, np.ndarray] = {}
     for field, values in columns.items():
-        lookup_dtype = np.float32 if feature_infos[field]["dtype"] == "float32" else np.int64
-        lookup = np.zeros(max_index + 1, dtype=lookup_dtype)
-        lookup[absolute_indices] = values.astype(lookup_dtype, copy=False)
+        ftype = feature_infos[field]["dtype"]
+        if ftype == "float32":
+            lookup_dtype = np.float32
+            lookup = np.zeros(max_index + 1, dtype=lookup_dtype)
+            lookup[absolute_indices] = values.astype(lookup_dtype, copy=False)
+        elif ftype == "int64":
+            lookup_dtype = np.int64
+            lookup = np.zeros(max_index + 1, dtype=lookup_dtype)
+            lookup[absolute_indices] = values.astype(lookup_dtype, copy=False)
+        elif ftype == "string":
+            lookup = np.full(max_index + 1, "", dtype=object)
+            lookup[absolute_indices] = values.astype(object, copy=False)
+        else:
+            raise ValueError(f"Unsupported annotation dtype '{ftype}' for field '{field}'.")
         lookups[field] = lookup
 
     data_files = sorted((dataset_root / "data").glob("chunk-*/file-*.parquet"))
@@ -464,11 +564,19 @@ def _write_columns_in_place(
                 default_value = 0
                 target_dtype = np.int64
                 pa_type = pa.int64()
+            elif ftype == "string":
+                default_value = ""
+                target_dtype = object
+                pa_type = pa.string()
             else:
                 raise ValueError(f"Unsupported annotation dtype '{ftype}' for field '{field}'.")
 
             if field in new_table.schema.names:
-                current = new_table[field].to_numpy().astype(target_dtype, copy=True)
+                current = new_table[field].to_numpy()
+                if ftype != "string":
+                    current = current.astype(target_dtype, copy=True)
+                else:
+                    current = current.astype(object, copy=True)
             else:
                 current = np.full(idx_np.shape[0], default_value, dtype=target_dtype)
 
@@ -476,7 +584,10 @@ def _write_columns_in_place(
                 subset_indices = idx_np[in_subset]
                 current[in_subset] = lookup[subset_indices]
 
-            array = pa.array(current, type=pa_type)
+            if ftype == "string":
+                array = pa.array(current.tolist(), type=pa_type)
+            else:
+                array = pa.array(current, type=pa_type)
             if field in new_table.schema.names:
                 col_idx = new_table.schema.names.index(field)
                 new_table = new_table.set_column(col_idx, field, array)
@@ -512,6 +623,7 @@ def _load_value_policy_and_processors(
     preprocessor, _ = make_pre_post_processors(
         policy_cfg=value_cfg,
         pretrained_path=pretrained_dir,
+        dataset_stats=dataset.meta.stats,
         preprocessor_overrides={"device_processor": {"device": device.type}},
     )
     return value_policy, value_cfg, preprocessor
@@ -613,6 +725,11 @@ def run_value_inference_pipeline(
     task_indices = np.asarray(raw_frames[value_cfg.task_index_feature], dtype=np.int64)
     episode_indices = np.asarray(raw_frames["episode_index"], dtype=np.int64)
     frame_indices = np.asarray(raw_frames["frame_index"], dtype=np.int64)
+    is_key_frame = (
+        np.asarray(raw_frames["is_key_frame"], dtype=np.bool_)
+        if "is_key_frame" in raw_frames.column_names
+        else np.zeros(frame_count, dtype=np.bool_)
+    )
 
     if cfg.acp.intervention_field in raw_frames.column_names:
         interventions = np.asarray(raw_frames[cfg.acp.intervention_field], dtype=np.float32)
@@ -635,6 +752,10 @@ def run_value_inference_pipeline(
         max_abs_index = int(np.max(absolute_indices))
         prediction_lookup = np.zeros(max_abs_index + 1, dtype=np.float32)
         prediction_seen = np.zeros(max_abs_index + 1, dtype=np.bool_)
+        stage_index_lookup = np.zeros(max_abs_index + 1, dtype=np.int64)
+        stage_progress_lookup = np.zeros(max_abs_index + 1, dtype=np.float32)
+        stage_value_lookup = np.zeros(max_abs_index + 1, dtype=np.float32)
+        stage_prediction_seen = np.zeros(max_abs_index + 1, dtype=np.bool_)
         logging.info(
             "Start value inference | world_size=%d batches=%d batch_size=%d checkpoint=%s",
             accelerator.num_processes,
@@ -645,6 +766,10 @@ def run_value_inference_pipeline(
     else:
         prediction_lookup = None
         prediction_seen = None
+        stage_index_lookup = None
+        stage_progress_lookup = None
+        stage_value_lookup = None
+        stage_prediction_seen = None
 
     value_policy.eval()
     eval_iter = tqdm(
@@ -664,16 +789,51 @@ def run_value_inference_pipeline(
 
             processed_batch = preprocessor(raw_batch)
             with accelerator.autocast():
-                predicted_value = accelerator.unwrap_model(value_policy).predict_value(processed_batch)
+                unwrapped_value_policy = accelerator.unwrap_model(value_policy)
+                if hasattr(unwrapped_value_policy, "predict_value_outputs"):
+                    predicted_outputs = unwrapped_value_policy.predict_value_outputs(processed_batch)
+                    predicted_value = predicted_outputs["value"]
+                else:
+                    predicted_outputs = {}
+                    predicted_value = unwrapped_value_policy.predict_value(processed_batch)
 
             gathered_idx = accelerator.gather_for_metrics(batch_indices)
             gathered_val = accelerator.gather_for_metrics(predicted_value)
+            gathered_stage_idx = None
+            gathered_stage_progress = None
+            gathered_stage_value = None
+            if cfg.acp.emit_ref_stage and "stage_index" in predicted_outputs:
+                gathered_stage_idx = accelerator.gather_for_metrics(predicted_outputs["stage_index"])
+                gathered_stage_progress = accelerator.gather_for_metrics(predicted_outputs["stage_progress"])
+                gathered_stage_value = accelerator.gather_for_metrics(predicted_outputs["stage_value"])
 
             if accelerator.is_main_process:
                 idx_np = gathered_idx.detach().cpu().numpy().astype(np.int64, copy=False).reshape(-1)
                 val_np = gathered_val.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1)
                 prediction_lookup[idx_np] = val_np
                 prediction_seen[idx_np] = True
+                if (
+                    gathered_stage_idx is not None
+                    and gathered_stage_progress is not None
+                    and gathered_stage_value is not None
+                    and stage_index_lookup is not None
+                    and stage_progress_lookup is not None
+                    and stage_value_lookup is not None
+                    and stage_prediction_seen is not None
+                ):
+                    stage_index_lookup[idx_np] = (
+                        gathered_stage_idx.detach().cpu().numpy().astype(np.int64, copy=False).reshape(-1)
+                    )
+                    stage_progress_lookup[idx_np] = (
+                        gathered_stage_progress.detach()
+                        .to(dtype=torch.float32, device="cpu")
+                        .numpy()
+                        .reshape(-1)
+                    )
+                    stage_value_lookup[idx_np] = (
+                        gathered_stage_value.detach().to(dtype=torch.float32, device="cpu").numpy().reshape(-1)
+                    )
+                    stage_prediction_seen[idx_np] = True
 
     accelerator.wait_for_everyone()
 
@@ -701,6 +861,38 @@ def run_value_inference_pipeline(
         feature_infos: dict[str, dict[str, Any]] = {
             cfg.acp.value_field: {"dtype": "float32", "shape": (1,), "names": None},
         }
+
+        if cfg.acp.emit_ref_stage:
+            if (
+                stage_index_lookup is not None
+                and stage_progress_lookup is not None
+                and stage_value_lookup is not None
+                and stage_prediction_seen is not None
+                and bool(np.all(stage_prediction_seen[absolute_indices]))
+            ):
+                stage_index = stage_index_lookup[absolute_indices]
+                stage_text = np.asarray([f"stage_{int(idx):02d}" for idx in stage_index], dtype=object)
+                stage_progress = stage_progress_lookup[absolute_indices]
+                stage_value = stage_value_lookup[absolute_indices]
+            else:
+                stage_text, stage_progress, stage_value = _compute_ref_stage_outputs(
+                    episode_indices=episode_indices,
+                    frame_indices=frame_indices,
+                    is_key_frame=is_key_frame,
+                    values=predicted_values,
+                )
+                stage_index = np.asarray(
+                    [int(str(stage).removeprefix("stage_")) for stage in stage_text],
+                    dtype=np.int64,
+                )
+            columns[cfg.acp.ref_stage_field] = stage_text
+            columns[cfg.acp.ref_stage_index_field] = stage_index.astype(np.int64)
+            columns[cfg.acp.ref_stage_progress_field] = stage_progress.astype(np.float32)
+            columns[cfg.acp.ref_stage_value_field] = stage_value.astype(np.float32)
+            feature_infos[cfg.acp.ref_stage_field] = {"dtype": "string", "shape": (1,), "names": None}
+            feature_infos[cfg.acp.ref_stage_index_field] = {"dtype": "int64", "shape": (1,), "names": None}
+            feature_infos[cfg.acp.ref_stage_progress_field] = {"dtype": "float32", "shape": (1,), "names": None}
+            feature_infos[cfg.acp.ref_stage_value_field] = {"dtype": "float32", "shape": (1,), "names": None}
 
         indicator_positive_ratio: float | None = None
         thresholds: dict[int, float] | None = None
