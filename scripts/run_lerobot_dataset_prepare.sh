@@ -1,90 +1,131 @@
 #!/usr/bin/env bash
 #
-# 一键：本地 v2.1 -> v3.0（convert 不 merge；all 才 merge）+ augment + 可选 report。
+# Prepare a local LeRobot dataset:
+#   all: convert sources, merge them, augment quantile stats, optionally report
+#   convert: convert sources without merging
+#   convert_v30_img2video: convert an existing v3 image dataset to video
+#   augment/report: operate on the requested dataset directly
 #
-# Usage:
-#   bash scripts/run_lerobot_dataset_prepare.sh              # all: convert+merge -> augment -> report
-#   bash scripts/run_lerobot_dataset_prepare.sh convert      # 仅 v21->v30，不 merge
-#   bash scripts/run_lerobot_dataset_prepare.sh convert_v30_img2video   # v3 image->video(h264)，默认源为合并后的 REPO_ID
-#   bash scripts/run_lerobot_dataset_prepare.sh augment
-#   bash scripts/run_lerobot_dataset_prepare.sh report
-#
-# 只改下面「==== 数据集 ====」块即可。image->video 源默认同合并后的 REPO_ID；否则运行前 export REPO_ID=org/name。
-# 输出默认 NEW_REPO_ID=org/合并名_video（可 export 覆盖）。可选 IMG2VIDEO_ROOT（--root）、IMG2VIDEO_WORKERS。
-#
-#   RUN_DATASET_REPORT=0 bash ...   # 跳过 all/convert/augment 末尾的 report
-#
+# Example:
+#   bash scripts/run_lerobot_dataset_prepare.sh all \
+#     --dataset-repo-id=org/merged --sources="source_a source_b"
+
 set -euo pipefail
 
-STEP="${1:-all}"
-RUN_DATASET_REPORT="${RUN_DATASET_REPORT:-1}"
-
-# ===== 与 run_valuefunc_train.sh 一致（按需修改） =====
-export USR_NAME="wanghao"
-export HF_LEROBOT_HOME="/mnt/nas/${USR_NAME}/data/lerobot_v3/"
-unset LEROBOT_HOME
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib_exp_preset.sh
+source "${SCRIPT_DIR}/lib_exp_preset.sh"
+evo_rl_parse_script_args "$@"
+evo_rl_apply_preset
+
+STEP="${EVO_RL_POSITIONAL[0]:-all}"
+RUN_DATASET_REPORT="${RUN_DATASET_REPORT:-1}"
+USR_NAME="${USR_NAME:-wanghao}"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}"
-export PYTHON="/mnt/data/miniconda3/envs/evo-rl_${USR_NAME}/bin/python"
+export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+PYTHON="${PYTHON:-/mnt/data/miniconda3/envs/evo-rl_${USR_NAME}/bin/python}"
 
-_LEROBOOT_CACHE_ROOT="/mnt/nas/.cache"
-mkdir -p "${_LEROBOOT_CACHE_ROOT}/hf_datasets" "${_LEROBOOT_CACHE_ROOT}/hf_home" "${_LEROBOOT_CACHE_ROOT}/tmp"
-export HF_DATASETS_CACHE="${_LEROBOOT_CACHE_ROOT}/hf_datasets"
-export HF_HOME="${_LEROBOOT_CACHE_ROOT}/hf_home"
-export TMPDIR="${_LEROBOOT_CACHE_ROOT}/tmp"
+CACHE_ROOT="${EVO_RL_CACHE_ROOT:-/mnt/nas/.cache}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${CACHE_ROOT}/hf_datasets}"
+export HF_HOME="${HF_HOME:-${CACHE_ROOT}/hf_home}"
+export TMPDIR="${TMPDIR:-${CACHE_ROOT}/tmp}"
+mkdir -p "${HF_DATASETS_CACHE}" "${HF_HOME}" "${TMPDIR}"
 
-# ===== 数据集（只改这里）=====
-ORG="desk_basket_pick"
-SOURCES=(
-  "basket_pick_0422_lerobot_poor"
-  "basket_pick_0422_lerobot"
-)
-MERGED="basket_pick_0422_s_140_f_9"
+if [[ -z "${DATASET_REPO_ID:-}" ]]; then
+  echo "ERROR: --dataset-repo-id is required." >&2
+  exit 1
+fi
 
-MERGE_OVERWRITE=0
-CONVERT_PUSH_HUB=0
+HF_ROOT="${HF_LEROBOT_HOME%/}"
+LOCAL_ROOT="${DATASET_ROOT:-${HF_ROOT}/${DATASET_REPO_ID}}"
+if [[ "${DATASET_REPO_ID}" == */* ]]; then
+  ORG="${DATASET_REPO_ID%%/*}"
+  MERGED="${DATASET_REPO_ID#*/}"
+  SOURCE_PARENT="${SOURCE_PARENT:-${ORG}}"
+  MERGE_OUTPUT_DIR="${HF_ROOT}/${ORG}"
+  NEW_REPO_ID="${NEW_REPO_ID:-${ORG}/${MERGED}_video}"
+else
+  ORG=""
+  MERGED="${DATASET_REPO_ID}"
+  SOURCE_PARENT="${SOURCE_PARENT:-.}"
+  MERGE_OUTPUT_DIR="${HF_ROOT}"
+  NEW_REPO_ID="${NEW_REPO_ID:-${DATASET_REPO_ID}_video}"
+fi
+if [[ "${SOURCE_PARENT}" == "." || -z "${SOURCE_PARENT}" ]]; then
+  SOURCE_DIR="${HF_ROOT}"
+else
+  SOURCE_DIR="${HF_ROOT}/${SOURCE_PARENT}"
+fi
 
-REPO_ID="${REPO_ID:-${ORG}/${MERGED}}"
-LOCAL_ROOT="${HF_LEROBOT_HOME%/}/${REPO_ID}"
-NEW_REPO_ID="${NEW_REPO_ID:-${ORG}/${MERGED}_video}"
+_require_sources() {
+  if [[ -z "${SOURCES:-}" ]]; then
+    echo "ERROR: --sources is required for step=${STEP} (space-separated dataset names)." >&2
+    exit 1
+  fi
+  read -r -a SOURCES_ARR <<< "${SOURCES}"
+  if [[ "${#SOURCES_ARR[@]}" -eq 0 ]]; then
+    echo "ERROR: --sources is empty." >&2
+    exit 1
+  fi
+}
+
+_sources_are_v30() {
+  local source version
+  for source in "${SOURCES_ARR[@]}"; do
+    if [[ ! -f "${SOURCE_DIR}/${source}/meta/info.json" ]]; then
+      return 1
+    fi
+    version="$("${PYTHON}" -c 'import json, sys; print(json.load(open(sys.argv[1])).get("codebase_version", ""))' \
+      "${SOURCE_DIR}/${source}/meta/info.json")"
+    if [[ "${version}" != "v3.0" ]]; then
+      return 1
+    fi
+  done
+}
 
 _convert() {
-  local do_merge="${1:?}"
+  local merge="$1"
+  _require_sources
+  local skip_convert="${SKIP_CONVERT:-0}"
+  if [[ "${skip_convert}" != "1" ]] && _sources_are_v30; then
+    skip_convert=1
+    echo "Sources are already v3.0; using merge-only mode."
+  fi
   local -a cmd=(
     "${PYTHON}" "${REPO_ROOT}/scripts/convert_local_lerobot_v21_to_v30.py"
-    "--parent-dir=lerobot/${ORG}"
-    "--repo-ids" "${SOURCES[@]}"
+    "--parent-dir=${SOURCE_DIR}"
+    "--repo-ids" "${SOURCES_ARR[@]}"
   )
-  if [[ "${do_merge}" == "1" ]]; then
-    cmd+=("--merge-output-dir=lerobot_v3/${ORG}" "--merge-repo-id=${MERGED}")
-    if [[ "${MERGE_OVERWRITE}" == "1" ]]; then
+  if [[ "${merge}" == "1" ]]; then
+    cmd+=("--merge-output-dir=${MERGE_OUTPUT_DIR}" "--merge-repo-id=${MERGED}")
+    if [[ "${MERGE_OVERWRITE:-0}" == "1" ]]; then
       cmd+=("--merge-overwrite")
     fi
   fi
-  if [[ "${CONVERT_PUSH_HUB}" == "1" ]]; then
+  if [[ "${skip_convert}" == "1" ]]; then
+    cmd+=("--skip-convert")
+  fi
+  if [[ "${CONVERT_PUSH_HUB:-0}" == "1" ]]; then
     cmd+=("--push-to-hub")
   fi
-  echo "Running: ${cmd[*]}"
+  printf 'Running:'
+  printf ' %q' "${cmd[@]}"
+  printf '\n'
   "${cmd[@]}"
 }
 
 _convert_v30_img2video() {
-  echo "HF_LEROBOT_HOME=${HF_LEROBOT_HOME}"
-  echo "convert_v30_img2video: repo_id=${REPO_ID} -> new_repo_id=${NEW_REPO_ID}"
   local -a cmd=(
     "${PYTHON}" -m lerobot.scripts.lerobot_edit_dataset
-    "--repo_id=${REPO_ID}"
+    "--repo_id=${DATASET_REPO_ID}"
     "--new_repo_id=${NEW_REPO_ID}"
     "--operation.type=convert_image_to_video"
     "--operation.vcodec=h264"
     "--operation.num_workers=${IMG2VIDEO_WORKERS:-16}"
   )
   if [[ -n "${IMG2VIDEO_ROOT:-}" ]]; then
-    cmd+=(--root="${IMG2VIDEO_ROOT}")
+    cmd+=("--root=${IMG2VIDEO_ROOT}")
   fi
-  echo "Running: ${cmd[*]}"
   "${cmd[@]}"
 }
 
@@ -93,10 +134,9 @@ _augment() {
     echo "ERROR: dataset root missing: ${LOCAL_ROOT}" >&2
     exit 1
   fi
-  echo "Augment quantile stats: repo_id=${REPO_ID} root=${LOCAL_ROOT}"
   "${PYTHON}" "${REPO_ROOT}/src/lerobot/datasets/v30/augment_dataset_quantile_stats.py" \
-    --repo-id="${REPO_ID}" \
-    --root="${LOCAL_ROOT}" \
+    "--repo-id=${DATASET_REPO_ID}" \
+    "--root=${LOCAL_ROOT}" \
     --overwrite
 }
 
@@ -105,10 +145,9 @@ _report() {
     echo "ERROR: dataset root missing for report: ${LOCAL_ROOT}" >&2
     exit 1
   fi
-  echo "Running dataset report: ${REPO_ID} (root=${HF_LEROBOT_HOME%/})"
   "${PYTHON}" -m lerobot.scripts.lerobot_dataset_report \
-    --dataset "${REPO_ID}" \
-    --root "${HF_LEROBOT_HOME%/}"
+    --dataset "${DATASET_REPO_ID}" \
+    --root "${HF_ROOT}"
 }
 
 case "${STEP}" in
@@ -121,33 +160,19 @@ case "${STEP}" in
     ;;
   convert_v30_img2video)
     _convert_v30_img2video
-    echo "Done (step=${STEP})."
-    exit 0
     ;;
   augment)
     _augment
     ;;
   report)
     _report
-    echo "Done (step=${STEP})."
-    exit 0
     ;;
   *)
-    echo "Usage: $0 [all|convert|convert_v30_img2video|augment|report]" >&2
+    echo "Usage: bash $0 [all|convert|convert_v30_img2video|augment|report] --dataset-repo-id=org/name [--sources=\"a b\"]" >&2
     exit 1
     ;;
 esac
 
-echo "Done (step=${STEP})."
-
-if [[ "${RUN_DATASET_REPORT}" == "1" ]]; then
-  if [[ -d "${LOCAL_ROOT}/meta" ]]; then
-    _report
-  elif [[ "${STEP}" == "all" ]] || [[ "${STEP}" == "augment" ]]; then
-    echo "WARN: skipping dataset report (missing ${LOCAL_ROOT}/meta)." >&2
-  else
-    echo "Skipping dataset report (step=${STEP})."
-  fi
-else
-  echo "Skipping dataset report (RUN_DATASET_REPORT=0)."
+if [[ "${RUN_DATASET_REPORT}" == "1" && "${STEP}" != "report" && -d "${LOCAL_ROOT}/meta" ]]; then
+  _report
 fi
