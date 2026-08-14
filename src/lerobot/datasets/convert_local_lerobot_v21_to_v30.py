@@ -21,7 +21,7 @@ first (as a new parent dir for merge inputs), and merge is also executed there.
 
 Example::
 
-python scripts/convert_local_lerobot_v21_to_v30.py \
+python -m lerobot.datasets.convert_local_lerobot_v21_to_v30 \
         --parent-dir lerobot/desk_basket_pick \
         --repo-ids basket_pick_0416_vla_lerobot basket_pick_0416_vla_lerobot_poor \
         --merge-output-dir lerobot_v3/desk_basket_pick \
@@ -85,7 +85,8 @@ DATA_REPACK_MAP = {
 }
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    # src/lerobot/datasets/<this file> -> repository root
+    return Path(__file__).resolve().parents[3]
 
 
 def _resolve_data_path(path: Path) -> Path:
@@ -555,9 +556,10 @@ def main() -> None:
                 converted_roots.append(converted_root)
                 print(f"  Merge source: {converted_root}", flush=True)
             elif ver == "v3.0":
-                _postprocess_converted_dataset(ds_dir)
+                # Do not postprocess in-place sources (would mutate originals).
+                # Postprocess runs on the merged output after merge.
                 converted_roots.append(ds_dir)
-                print(f"  Merge source (in-place v3.0): {ds_dir}", flush=True)
+                print(f"  Merge source (in-place v3.0, deferred postprocess): {ds_dir}", flush=True)
             else:
                 print(
                     f"Refusing merge-only: expected v3.0 at {v30_dir} or in-place at {ds_dir}, "
@@ -640,6 +642,8 @@ def main() -> None:
                     )
                     sys.exit(1)
             _merge_local(converted_roots, out, args.merge_repo_id)
+            _postprocess_converted_dataset(out)
+            print(f"Postprocessed merged dataset: {out}", flush=True)
     finally:
         _print_elapsed_time()
 

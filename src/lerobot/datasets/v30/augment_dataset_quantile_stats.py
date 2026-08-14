@@ -49,6 +49,49 @@ from lerobot.datasets.utils import write_stats
 from lerobot.utils.utils import init_logging
 
 
+def _quat_to_matrix(quat: np.ndarray) -> np.ndarray:
+    quat = np.asarray(quat, dtype=np.float32)
+    quat = quat / np.maximum(np.linalg.norm(quat, axis=-1, keepdims=True), 1e-8)
+    x, y, z, w = np.moveaxis(quat, -1, 0)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    row0 = np.stack([1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)], axis=-1)
+    row1 = np.stack([2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)], axis=-1)
+    row2 = np.stack([2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)], axis=-1)
+    return np.stack([row0, row1, row2], axis=-2)
+
+
+def _matrix_first_two_cols_to_rot6d(matrix: np.ndarray) -> np.ndarray:
+    """Flatten the first two rotation-matrix columns as ``[col0, col1]``."""
+    return np.concatenate([matrix[..., :, 0], matrix[..., :, 1]], axis=-1)
+
+
+def _quat_pose_to_rot6d(x: np.ndarray) -> np.ndarray:
+    """Convert dual-arm xyz+quat to [left pose9, right pose9, raw tail]."""
+    x = np.asarray(x, dtype=np.float32)
+    if x.shape[-1] < 14:
+        raise ValueError(f"Expected last dim >= 14 for dual-arm xyz+quat layout, got {x.shape}")
+    left = _matrix_first_two_cols_to_rot6d(_quat_to_matrix(x[..., 3:7]))
+    right = _matrix_first_two_cols_to_rot6d(_quat_to_matrix(x[..., 10:14]))
+    return np.concatenate([x[..., :3], left, x[..., 7:10], right, x[..., 14:]], axis=-1)
+
+
+def _pad_or_clip_last_dim(x: np.ndarray, dim: int) -> np.ndarray:
+    if x.shape[-1] > dim:
+        return x[..., :dim]
+    if x.shape[-1] < dim:
+        return np.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, dim - x.shape[-1])])
+    return x
+
+
+def _feature_array(batch, key: str) -> np.ndarray | None:
+    if key not in batch.column_names:
+        return None
+    col = batch[key]
+    return np.stack([np.asarray(v) for v in col]) if isinstance(col, list) else np.asarray(col)
+
+
 def _quantile_list_keys() -> list[str]:
     return [f"q{int(q * 100):02d}" for q in DEFAULT_QUANTILES]
 
@@ -71,7 +114,27 @@ def needs_scalar_quantile_stats(features: dict, stats: dict[str, dict] | None) -
     return False
 
 
-def process_single_episode(dataset: LeRobotDataset, episode_idx: int) -> dict:
+def _subtract_state_delta(actions_rot6d: np.ndarray, state_rot6d: np.ndarray, dims: int) -> np.ndarray:
+    """actions_rot6d[..., :dims] -= state, broadcasting a trailing time/horizon dim if needed."""
+    out = actions_rot6d.copy()
+    if actions_rot6d.ndim == state_rot6d.ndim:
+        out[..., :dims] -= state_rot6d[..., :dims]
+    else:
+        out[..., :dims] -= state_rot6d[..., None, :dims]
+    return out
+
+
+def process_single_episode(
+    dataset: LeRobotDataset,
+    episode_idx: int,
+    *,
+    pi0_dmp_rot6d_stats: bool = False,
+    pi0_dmp_rot6d_delta: bool = False,
+    pi05_rot6d_stats: bool = False,
+    pi05_rot6d_delta: bool = False,
+    rot6d_state_dim: int = 32,
+    rot6d_action_dim: int = 32,
+) -> dict:
     """Process a single episode and return statistics for non-visual features only.
 
     Image/video pixel statistics are skipped (training uses ImageNet mean/std at load time).
@@ -89,17 +152,110 @@ def process_single_episode(dataset: LeRobotDataset, episode_idx: int) -> dict:
 
     ep_stats = {}
     for key in scalar_keys:
-        col = batch[key]
-        data = np.stack([np.asarray(v) for v in col]) if isinstance(col, list) else np.asarray(col)
+        data = _feature_array(batch, key)
+        if data is None:
+            continue
         keepdims = data.ndim == 1
         ep_stats[key] = get_feature_stats(
             data, axis=0, keepdims=keepdims, quantile_list=DEFAULT_QUANTILES
         )
 
+    if pi0_dmp_rot6d_stats:
+        state = _feature_array(batch, "ee_state")
+        ref_state = _feature_array(batch, "ref_ee_state")
+        actions = _feature_array(batch, "ee_actions")
+        ref_actions = _feature_array(batch, "ref_ee_actions")
+
+        if state is not None:
+            state_rot6d = _pad_or_clip_last_dim(
+                _quat_pose_to_rot6d(state),
+                rot6d_state_dim,
+            )
+            ep_stats["observation.state"] = get_feature_stats(
+                state_rot6d, axis=0, keepdims=False, quantile_list=DEFAULT_QUANTILES
+            )
+        if ref_state is not None:
+            ref_state_rot6d = _pad_or_clip_last_dim(
+                _quat_pose_to_rot6d(ref_state),
+                rot6d_state_dim,
+            )
+            ep_stats["observation.reference.state"] = get_feature_stats(
+                ref_state_rot6d, axis=0, keepdims=False, quantile_list=DEFAULT_QUANTILES
+            )
+        # Absolute Rot6D by default; optional pose-only delta (first 18 dims).
+        pose_delta_dims = 18
+        if actions is not None:
+            actions_rot6d = _pad_or_clip_last_dim(
+                _quat_pose_to_rot6d(actions),
+                rot6d_action_dim,
+            )
+            if pi0_dmp_rot6d_delta and state is not None:
+                state_rot6d = _pad_or_clip_last_dim(
+                    _quat_pose_to_rot6d(state),
+                    rot6d_state_dim,
+                )
+                dims = min(pose_delta_dims, rot6d_action_dim, rot6d_state_dim)
+                actions_rot6d = actions_rot6d.copy()
+                actions_rot6d[..., :dims] -= state_rot6d[:, None, :dims]
+            ep_stats["action"] = get_feature_stats(
+                actions_rot6d, axis=0, keepdims=False, quantile_list=DEFAULT_QUANTILES
+            )
+        if ref_actions is not None:
+            ref_actions_rot6d = _pad_or_clip_last_dim(
+                _quat_pose_to_rot6d(ref_actions),
+                rot6d_action_dim,
+            )
+            if pi0_dmp_rot6d_delta and ref_state is not None:
+                ref_state_rot6d = _pad_or_clip_last_dim(
+                    _quat_pose_to_rot6d(ref_state),
+                    rot6d_state_dim,
+                )
+                dims = min(pose_delta_dims, rot6d_action_dim, rot6d_state_dim)
+                ref_actions_rot6d = ref_actions_rot6d.copy()
+                ref_actions_rot6d[..., :dims] -= ref_state_rot6d[:, None, :dims]
+            ep_stats["observation.ref_actions"] = get_feature_stats(
+                ref_actions_rot6d, axis=0, keepdims=False, quantile_list=DEFAULT_QUANTILES
+            )
+
+    elif pi05_rot6d_stats:
+        # pi05 datasets store EE quat under observation.ee_*; joint observation.state is unused.
+        state = _feature_array(batch, "observation.ee_state")
+        if state is None:
+            state = _feature_array(batch, "ee_state")
+        actions = _feature_array(batch, "observation.ee_actions")
+        if actions is None:
+            actions = _feature_array(batch, "ee_actions")
+
+        pose_delta_dims = 18
+        if state is not None:
+            state_rot6d = _pad_or_clip_last_dim(_quat_pose_to_rot6d(state), rot6d_state_dim)
+            ep_stats["observation.state"] = get_feature_stats(
+                state_rot6d, axis=0, keepdims=False, quantile_list=DEFAULT_QUANTILES
+            )
+        # Absolute Rot6D by default; optional pose-only delta.
+        if actions is not None:
+            actions_rot6d = _pad_or_clip_last_dim(_quat_pose_to_rot6d(actions), rot6d_action_dim)
+            if pi05_rot6d_delta and state is not None:
+                state_rot6d = _pad_or_clip_last_dim(_quat_pose_to_rot6d(state), rot6d_state_dim)
+                dims = min(pose_delta_dims, rot6d_action_dim, rot6d_state_dim)
+                actions_rot6d = _subtract_state_delta(actions_rot6d, state_rot6d, dims)
+            ep_stats["action"] = get_feature_stats(
+                actions_rot6d, axis=0, keepdims=False, quantile_list=DEFAULT_QUANTILES
+            )
+
     return ep_stats
 
 
-def compute_quantile_stats_for_dataset(dataset: LeRobotDataset) -> dict[str, dict]:
+def compute_quantile_stats_for_dataset(
+    dataset: LeRobotDataset,
+    *,
+    pi0_dmp_rot6d_stats: bool = False,
+    pi0_dmp_rot6d_delta: bool = False,
+    pi05_rot6d_stats: bool = False,
+    pi05_rot6d_delta: bool = False,
+    rot6d_state_dim: int = 32,
+    rot6d_action_dim: int = 32,
+) -> dict[str, dict]:
     """Compute quantile statistics for all episodes in the dataset.
 
     Args:
@@ -123,11 +279,32 @@ def compute_quantile_stats_for_dataset(dataset: LeRobotDataset) -> dict[str, dic
 
     if max_workers <= 1:
         for episode_idx in tqdm(range(dataset.num_episodes), desc="Processing episodes"):
-            episode_stats_list.append(process_single_episode(dataset, episode_idx))
+            episode_stats_list.append(
+                process_single_episode(
+                    dataset,
+                    episode_idx,
+                    pi0_dmp_rot6d_stats=pi0_dmp_rot6d_stats,
+                    pi0_dmp_rot6d_delta=pi0_dmp_rot6d_delta,
+                    pi05_rot6d_stats=pi05_rot6d_stats,
+                    pi05_rot6d_delta=pi05_rot6d_delta,
+                    rot6d_state_dim=rot6d_state_dim,
+                    rot6d_action_dim=rot6d_action_dim,
+                )
+            )
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_episode = {
-                executor.submit(process_single_episode, dataset, episode_idx): episode_idx
+                executor.submit(
+                    process_single_episode,
+                    dataset,
+                    episode_idx,
+                    pi0_dmp_rot6d_stats=pi0_dmp_rot6d_stats,
+                    pi0_dmp_rot6d_delta=pi0_dmp_rot6d_delta,
+                    pi05_rot6d_stats=pi05_rot6d_stats,
+                    pi05_rot6d_delta=pi05_rot6d_delta,
+                    rot6d_state_dim=rot6d_state_dim,
+                    rot6d_action_dim=rot6d_action_dim,
+                ): episode_idx
                 for episode_idx in range(dataset.num_episodes)
             }
 
@@ -154,6 +331,12 @@ def augment_dataset_with_quantile_stats(
     root: str | Path | None = None,
     overwrite: bool = False,
     push_to_hub: bool = False,
+    pi0_dmp_rot6d_stats: bool = False,
+    pi0_dmp_rot6d_delta: bool = False,
+    pi05_rot6d_stats: bool = False,
+    pi05_rot6d_delta: bool = False,
+    rot6d_state_dim: int = 32,
+    rot6d_action_dim: int = 32,
 ) -> None:
     """Augment a dataset with quantile statistics if they are missing.
 
@@ -162,7 +345,13 @@ def augment_dataset_with_quantile_stats(
         root: Local root directory for the dataset
         overwrite: Overwrite existing quantile statistics if they already exist
         push_to_hub: Push updated dataset metadata to Hugging Face Hub
+        pi0_dmp_rot6d_stats: Write DMP absolute Rot6D stats from ee_* / ref_* keys
+        pi0_dmp_rot6d_delta: If True with pi0_dmp_rot6d_stats, use pose-only delta for actions
+        pi05_rot6d_stats: Write pi05 absolute Rot6D stats from observation.ee_* keys
+        pi05_rot6d_delta: If True with pi05_rot6d_stats, use pose-only delta for action stats
     """
+    if pi0_dmp_rot6d_stats and pi05_rot6d_stats:
+        raise ValueError("Use only one of pi0_dmp_rot6d_stats / pi05_rot6d_stats")
     root_path = Path(root).expanduser().resolve() if root is not None else None
     # Local datasets under ``--root`` are opened by absolute path; using a Hub-style ``org/name`` as
     # ``repo_id`` still triggers ``get_safe_version`` → Hub on cache miss (breaks offline). Use the
@@ -181,7 +370,15 @@ def augment_dataset_with_quantile_stats(
 
     logging.info("Computing quantile statistics for scalar features...")
 
-    new_stats = compute_quantile_stats_for_dataset(dataset)
+    new_stats = compute_quantile_stats_for_dataset(
+        dataset,
+        pi0_dmp_rot6d_stats=pi0_dmp_rot6d_stats,
+        pi0_dmp_rot6d_delta=pi0_dmp_rot6d_delta,
+        pi05_rot6d_stats=pi05_rot6d_stats,
+        pi05_rot6d_delta=pi05_rot6d_delta,
+        rot6d_state_dim=rot6d_state_dim,
+        rot6d_action_dim=rot6d_action_dim,
+    )
 
     logging.info("Updating dataset metadata with new quantile statistics")
     dataset.meta.stats = new_stats
@@ -230,6 +427,31 @@ def main():
         action="store_true",
         help="Push updated dataset metadata to Hugging Face Hub (default: local-only).",
     )
+    parser.add_argument(
+        "--pi0-dmp-rot6d-stats",
+        action="store_true",
+        help="Also write PI0-DMP absolute Rot6D stats for state/ref_state and action/ref_actions.",
+    )
+    parser.add_argument(
+        "--pi0-dmp-rot6d-delta",
+        action="store_true",
+        help="With --pi0-dmp-rot6d-stats, write pose-only delta action/ref_actions stats instead of absolute.",
+    )
+    parser.add_argument(
+        "--pi05-rot6d-stats",
+        action="store_true",
+        help=(
+            "Also write pi05 absolute Rot6D stats for observation.state/action from "
+            "observation.ee_state / observation.ee_actions (does not affect pi0_dmp)."
+        ),
+    )
+    parser.add_argument(
+        "--pi05-rot6d-delta",
+        action="store_true",
+        help="With --pi05-rot6d-stats, write pose-only delta action stats instead of absolute.",
+    )
+    parser.add_argument("--rot6d-state-dim", type=int, default=32)
+    parser.add_argument("--rot6d-action-dim", type=int, default=32)
 
     args = parser.parse_args()
     root = Path(args.root) if args.root else None
@@ -241,6 +463,12 @@ def main():
         root=root,
         overwrite=args.overwrite,
         push_to_hub=args.push_to_hub,
+        pi0_dmp_rot6d_stats=args.pi0_dmp_rot6d_stats,
+        pi0_dmp_rot6d_delta=args.pi0_dmp_rot6d_delta,
+        pi05_rot6d_stats=args.pi05_rot6d_stats,
+        pi05_rot6d_delta=args.pi05_rot6d_delta,
+        rot6d_state_dim=args.rot6d_state_dim,
+        rot6d_action_dim=args.rot6d_action_dim,
     )
 
 

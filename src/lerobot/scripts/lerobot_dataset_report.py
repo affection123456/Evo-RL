@@ -27,13 +27,12 @@ lerobot-dataset-report --dataset ~/.cache/huggingface/lerobot/local/eval_twl2_10
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pyarrow.dataset as pa_ds
-
-from lerobot.datasets.utils import load_episodes, load_info, load_tasks
-from lerobot.utils.constants import HF_LEROBOT_HOME
+import pandas as pd
 
 
 def resolve_dataset_root(dataset: str, root: Path | None) -> Path:
@@ -41,7 +40,10 @@ def resolve_dataset_root(dataset: str, root: Path | None) -> Path:
     if dataset_path.exists():
         return dataset_path.resolve()
 
-    base_root = root.expanduser().resolve() if root is not None else HF_LEROBOT_HOME.resolve()
+    hf_lerobot_home = Path(
+        os.environ.get("HF_LEROBOT_HOME", Path.home() / ".cache" / "huggingface" / "lerobot")
+    )
+    base_root = root.expanduser().resolve() if root is not None else hf_lerobot_home.resolve()
     candidates = [base_root / dataset]
     if "/" not in dataset.strip("/"):
         candidates.append(base_root / "local" / dataset)
@@ -52,6 +54,21 @@ def resolve_dataset_root(dataset: str, root: Path | None) -> Path:
 
     searched = "\n".join(f"- {c}" for c in candidates)
     raise FileNotFoundError(f"Dataset path not found. Searched:\n{searched}")
+
+
+def load_info_light(local_dir: Path) -> dict[str, Any]:
+    with (local_dir / "meta" / "info.json").open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_tasks_light(local_dir: Path) -> pd.DataFrame:
+    return pd.read_parquet(local_dir / "meta" / "tasks.parquet")
+
+
+def load_episodes_light(local_dir: Path) -> pd.DataFrame:
+    episodes_dataset = pa_ds.dataset(local_dir / "meta" / "episodes", format="parquet")
+    columns = [name for name in episodes_dataset.schema.names if not name.startswith("stats/")]
+    return episodes_dataset.to_table(columns=columns).to_pandas()
 
 
 def _to_float(value: Any) -> float:
@@ -131,9 +148,8 @@ def _format_ascii_histogram(histogram: list[dict[str, float | int]], bar_width: 
 
 
 def build_report(dataset_root: Path) -> dict[str, Any]:
-    info = load_info(dataset_root)
-    episodes_ds = load_episodes(dataset_root)
-    episodes_df = episodes_ds.to_pandas()
+    info = load_info_light(dataset_root)
+    episodes_df = load_episodes_light(dataset_root)
 
     actual_episode_count = int(len(episodes_df))
     episode_success_labels = (
@@ -171,7 +187,7 @@ def build_report(dataset_root: Path) -> dict[str, Any]:
                 intervention_episode_ids.add(int(ep_idx))
         intervention_episode_count = len(intervention_episode_ids)
 
-    tasks_df = load_tasks(dataset_root)
+    tasks_df = load_tasks_light(dataset_root)
     unique_tasks: list[str] = []
     seen_tasks: set[str] = set()
     if "tasks" in episodes_df.columns:
