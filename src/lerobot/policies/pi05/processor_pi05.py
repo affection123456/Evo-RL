@@ -24,6 +24,11 @@ import torch
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import pad_vector
+from lerobot.policies.pi0_dmp.processor_pi0_dmp import (
+    _pad_or_clip,
+    _quat_pose_to_rot6d,
+    _rot6d_pose_to_quat,
+)
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -36,13 +41,181 @@ from lerobot.processor import (
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
 )
-from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+from lerobot.processor.converters import (
+    _extract_complementary_data,
+    create_transition,
+    policy_action_to_transition,
+    transition_to_policy_action,
+)
 from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
+    ACTION,
+    OBS_IMAGES,
+    OBS_PREFIX,
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+
+OBS_TOP_HEAD = f"{OBS_IMAGES}.top_head"
+OBS_HAND_RIGHT = f"{OBS_IMAGES}.hand_right"
+OBS_HAND_LEFT = f"{OBS_IMAGES}.hand_left"
+OBS_EE_STATE = "observation.ee_state"
+OBS_EE_ACTIONS = "observation.ee_actions"
+PI05_ROT6D_POSE_DIM = 18
+
+
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any | None:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
+
+
+def pi05_batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
+    """Pack basket ``observation.*`` and DMP bare keys into a pi05 observation dict.
+
+    Standard ``batch_to_transition`` only keeps keys with the ``observation.`` prefix, so
+    DMP fields like ``ee_state`` / ``top_head`` never become an observation and the
+    preprocessor fails. This converter accepts both layouts.
+    """
+    if not isinstance(batch, dict):
+        raise ValueError(f"EnvTransition must be a dictionary. Got {type(batch).__name__}")
+
+    observation = {key: value for key, value in batch.items() if key.startswith(OBS_PREFIX)}
+
+    for canonical_key, aliases in (
+        (OBS_EE_STATE, (OBS_EE_STATE, "ee_state")),
+        (OBS_EE_ACTIONS, (OBS_EE_ACTIONS, "ee_actions")),
+        (OBS_TOP_HEAD, (OBS_TOP_HEAD, "top_head")),
+        (OBS_HAND_RIGHT, (OBS_HAND_RIGHT, "hand_right")),
+        (OBS_HAND_LEFT, (OBS_HAND_LEFT, "hand_left")),
+    ):
+        if canonical_key not in observation:
+            value = _first_present(batch, *aliases)
+            if value is not None:
+                observation[canonical_key] = value
+
+    complementary_data = _extract_complementary_data(batch)
+    return create_transition(
+        observation=observation if observation else None,
+        action=batch.get(ACTION),
+        complementary_data=complementary_data if complementary_data else None,
+    )
+
+
+@ProcessorStepRegistry.register(name="pi05_rot6d_delta_processor")
+@dataclass
+class Pi05Rot6DDeltaProcessorStep(ProcessorStep):
+    """Map dual-arm EE quaternion pose to full32 Rot6D state/actions."""
+
+    state_dim: int = 32
+    action_dim: int = 32
+    ee_state_key: str = "observation.ee_state"
+    ee_action_key: str = "observation.ee_actions"
+    use_delta: bool = False
+    delta_dims: int | None = None
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "state_dim": self.state_dim,
+            "action_dim": self.action_dim,
+            "ee_state_key": self.ee_state_key,
+            "ee_action_key": self.ee_action_key,
+            "use_delta": self.use_delta,
+            "delta_dims": self.delta_dims,
+        }
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        transition = transition.copy()
+        observation = dict(transition.get(TransitionKey.OBSERVATION) or {})
+
+        raw_state = _first_present(observation, self.ee_state_key, "ee_state", OBS_STATE)
+        if raw_state is None:
+            raise KeyError(
+                f"pi05 Rot6D requires EE quat state; missing any of "
+                f"{self.ee_state_key!r}, 'ee_state', {OBS_STATE!r}"
+            )
+        state = _pad_or_clip(_quat_pose_to_rot6d(torch.as_tensor(raw_state)), self.state_dim)
+
+        # Prefer EE quat actions; dataset `action` is often joint-space and must not be used.
+        raw_action = _first_present(observation, self.ee_action_key, "ee_actions")
+        if raw_action is None:
+            raw_action = transition.get(TransitionKey.ACTION)
+        actions = (
+            None
+            if raw_action is None
+            else _pad_or_clip(_quat_pose_to_rot6d(torch.as_tensor(raw_action)), self.action_dim)
+        )
+
+        if self.use_delta and actions is not None:
+            delta_dims = PI05_ROT6D_POSE_DIM if self.delta_dims is None else self.delta_dims
+            dims = min(delta_dims, self.action_dim, self.state_dim)
+            if dims > 0:
+                actions = actions.clone()
+                state_for_delta = state
+                if actions.ndim == state.ndim + 1:
+                    state_for_delta = state.unsqueeze(-2)
+                actions[..., :dims] = actions[..., :dims] - state_for_delta[..., :dims]
+
+        observation[OBS_STATE] = state
+        transition[TransitionKey.OBSERVATION] = observation
+        if actions is not None:
+            transition[TransitionKey.ACTION] = actions
+        return transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+def decode_pi05_policy_actions(
+    actions: torch.Tensor,
+    raw_observation: dict[str, Any],
+    policy_cfg: PI05Config | Any,
+) -> torch.Tensor:
+    """Convert full32 Rot6D model outputs to absolute dual-arm quaternion EE actions."""
+    if not getattr(policy_cfg, "use_rot6d", False):
+        return actions
+
+    decoded = actions
+    state_value = _first_present(
+        raw_observation,
+        getattr(policy_cfg, "ee_state_key", "observation.ee_state"),
+        "observation.ee_state",
+        "ee_state",
+        OBS_STATE,
+        "observation/state",
+    )
+    if getattr(policy_cfg, "rot6d_delta_action", False) and state_value is not None:
+        max_state_dim = getattr(policy_cfg, "max_state_dim", actions.shape[-1])
+        max_action_dim = getattr(policy_cfg, "max_action_dim", actions.shape[-1])
+        delta_dims = min(PI05_ROT6D_POSE_DIM, max_action_dim, max_state_dim)
+
+        state = _pad_or_clip(_quat_pose_to_rot6d(torch.as_tensor(state_value)), max_state_dim)
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        state = state.to(device=actions.device, dtype=actions.dtype)
+
+        decoded = actions.clone()
+        if delta_dims > 0:
+            state_for_delta = state
+            if decoded.ndim == state.ndim + 1:
+                state_for_delta = state.unsqueeze(-2)
+            decoded[..., :delta_dims] = decoded[..., :delta_dims] + state_for_delta[..., :delta_dims]
+
+    ee_action = _first_present(
+        raw_observation,
+        getattr(policy_cfg, "ee_action_key", "observation.ee_actions"),
+        "observation.ee_actions",
+        "ee_actions",
+        ACTION,
+    )
+    decoded = _rot6d_pose_to_quat(decoded)
+    if ee_action is not None:
+        decoded = _pad_or_clip(decoded, int(torch.as_tensor(ee_action).shape[-1]))
+    return decoded
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -129,9 +302,22 @@ def make_pi05_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    rot6d_steps: list[ProcessorStep] = []
+    if getattr(config, "use_rot6d", False):
+        rot6d_steps = [
+            Pi05Rot6DDeltaProcessorStep(
+                state_dim=config.max_state_dim,
+                action_dim=config.max_action_dim,
+                ee_state_key=config.ee_state_key,
+                ee_action_key=config.ee_action_key,
+                use_delta=bool(getattr(config, "rot6d_delta_action", False)),
+            )
+        ]
+
     # Add remaining processors
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
+        *rot6d_steps,
         AddBatchDimensionProcessorStep(),
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
@@ -161,6 +347,7 @@ def make_pi05_pre_post_processors(
         PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
             steps=input_steps,
             name=POLICY_PREPROCESSOR_DEFAULT_NAME,
+            to_transition=pi05_batch_to_transition,
         ),
         PolicyProcessorPipeline[PolicyAction, PolicyAction](
             steps=output_steps,

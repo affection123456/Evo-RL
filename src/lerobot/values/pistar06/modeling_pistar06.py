@@ -122,6 +122,70 @@ def compute_normalized_value_targets(
     return targets
 
 
+def compute_keyframe_stage_targets(
+    episode_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    is_key_frame: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build stage supervision from keyframe pairs within each episode.
+
+    Stage index is the keyframe-pair segment id. Stage progress is [0, 1] inside
+    that segment. Stage value is normalized remaining progress in the segment
+    using the same negative-value convention as the global value target.
+    """
+    if not (episode_indices.shape == frame_indices.shape == is_key_frame.shape):
+        raise ValueError("episode_indices, frame_indices, and is_key_frame must have identical shapes.")
+
+    n = episode_indices.shape[0]
+    stage_indices = np.zeros(n, dtype=np.int64)
+    stage_progress = np.zeros(n, dtype=np.float32)
+    stage_values = np.zeros(n, dtype=np.float32)
+
+    for ep in np.unique(episode_indices.astype(np.int64, copy=False)):
+        ep_mask = episode_indices == ep
+        row_indices = np.where(ep_mask)[0]
+        ep_frames = frame_indices[ep_mask].astype(np.int64, copy=False)
+        ep_key_flags = is_key_frame[ep_mask].astype(np.bool_, copy=False)
+        if row_indices.size == 0:
+            continue
+
+        order = np.argsort(ep_frames, kind="stable")
+        row_indices = row_indices[order]
+        ep_frames = ep_frames[order]
+        ep_key_flags = ep_key_flags[order]
+        key_frames = np.unique(ep_frames[ep_key_flags]).astype(np.int64, copy=False)
+
+        if key_frames.size < 2:
+            start = int(ep_frames[0])
+            end = int(ep_frames[-1])
+            denom = max(end - start, 1)
+            for row_idx, frame_idx in zip(row_indices, ep_frames, strict=True):
+                progress = min(max((int(frame_idx) - start) / denom, 0.0), 1.0)
+                stage_progress[row_idx] = np.float32(progress)
+                stage_values[row_idx] = np.float32(progress - 1.0)
+            continue
+
+        for row_idx, frame_idx in zip(row_indices, ep_frames, strict=True):
+            frame_int = int(frame_idx)
+            if frame_int <= int(key_frames[0]):
+                stage_idx = 0
+            elif frame_int >= int(key_frames[-1]):
+                stage_idx = int(key_frames.size - 2)
+            else:
+                stage_idx = int(np.searchsorted(key_frames, frame_int, side="right") - 1)
+                stage_idx = min(max(stage_idx, 0), int(key_frames.size - 2))
+
+            seg_start = int(key_frames[stage_idx])
+            seg_end = int(key_frames[stage_idx + 1])
+            denom = max(seg_end - seg_start, 1)
+            progress = min(max((frame_int - seg_start) / denom, 0.0), 1.0)
+            stage_indices[row_idx] = stage_idx
+            stage_progress[row_idx] = np.float32(progress)
+            stage_values[row_idx] = np.float32(progress - 1.0)
+
+    return stage_indices, stage_progress, stage_values
+
+
 def _resolve_load_dtype(dtype_name: str) -> torch.dtype:
     requested_dtype = torch.bfloat16 if dtype_name == "bfloat16" else torch.float32
     if requested_dtype == torch.bfloat16 and not torch.cuda.is_available():
@@ -336,6 +400,25 @@ class Pistar06Model(nn.Module):
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.fusion_hidden_dim, cfg.num_bins),
         )
+        if cfg.enable_stage_heads:
+            self.stage_head = nn.Sequential(
+                nn.Linear(cfg.fusion_hidden_dim * 2, cfg.fusion_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.fusion_hidden_dim, cfg.num_stage_classes),
+            )
+            self.stage_progress_head = nn.Sequential(
+                nn.Linear(cfg.fusion_hidden_dim * 2, cfg.fusion_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.fusion_hidden_dim, 1),
+            )
+            self.stage_value_head = nn.Sequential(
+                nn.Linear(cfg.fusion_hidden_dim * 2, cfg.fusion_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.fusion_hidden_dim, cfg.num_bins),
+            )
 
         if cfg.use_gradient_checkpointing:
             _maybe_enable_gradient_checkpointing(self.language_model)
@@ -416,7 +499,7 @@ class Pistar06Model(nn.Module):
         flat_images = flat_images * camera_mask
         return flat_images
 
-    def forward(
+    def encode_joint_features(
         self,
         input_ids: Tensor,
         attention_mask: Tensor,
@@ -479,7 +562,41 @@ class Pistar06Model(nn.Module):
         language_token = self.language_projector(language_features)
 
         joint_features = torch.cat([image_pooled, language_token], dim=-1)
-        return self.value_head(self.final_norm(joint_features))
+        return self.final_norm(joint_features)
+
+    def forward_outputs(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        images: Tensor,
+        image_attention_mask: Tensor,
+    ) -> dict[str, Tensor]:
+        joint_features = self.encode_joint_features(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            images=images,
+            image_attention_mask=image_attention_mask,
+        )
+        outputs = {"value_logits": self.value_head(joint_features)}
+        if self.cfg.enable_stage_heads:
+            outputs["stage_logits"] = self.stage_head(joint_features)
+            outputs["stage_progress"] = torch.sigmoid(self.stage_progress_head(joint_features)).squeeze(-1)
+            outputs["stage_value_logits"] = self.stage_value_head(joint_features)
+        return outputs
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        images: Tensor,
+        image_attention_mask: Tensor,
+    ) -> Tensor:
+        return self.forward_outputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            images=images,
+            image_attention_mask=image_attention_mask,
+        )["value_logits"]
 
 
 class Pistar06Policy(PreTrainedPolicy):
@@ -651,19 +768,29 @@ class Pistar06Policy(PreTrainedPolicy):
         raise RuntimeError("Pistar06Policy is a value model and does not support action selection.")
 
     def predict_value(self, batch: dict[str, Tensor]) -> Tensor:
+        return self.predict_value_outputs(batch)["value"]
+
+    def predict_value_outputs(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         input_ids = batch[OBS_LANGUAGE_TOKENS]
         attention_mask = batch[OBS_LANGUAGE_ATTENTION_MASK]
         images = batch[PISTAR06_IMAGES_KEY]
         image_attention_mask = batch[PISTAR06_IMAGE_MASK_KEY]
 
-        logits = self.model(
+        raw_outputs = self.model.forward_outputs(
             input_ids=input_ids,
             attention_mask=attention_mask,
             images=images,
             image_attention_mask=image_attention_mask,
         )
-        bin_centers = self.bin_centers.to(device=logits.device)
-        return expected_value_from_logits(logits, bin_centers)
+        bin_centers = self.bin_centers.to(device=raw_outputs["value_logits"].device)
+        outputs = {
+            "value": expected_value_from_logits(raw_outputs["value_logits"], bin_centers),
+        }
+        if "stage_logits" in raw_outputs:
+            outputs["stage_index"] = torch.argmax(raw_outputs["stage_logits"], dim=-1)
+            outputs["stage_progress"] = raw_outputs["stage_progress"]
+            outputs["stage_value"] = expected_value_from_logits(raw_outputs["stage_value_logits"], bin_centers)
+        return outputs
 
     def build_training_raw_batch_hook(self, dataset, targets_cfg):
         raw_frames = dataset.hf_dataset.with_format(None)
@@ -674,6 +801,11 @@ class Pistar06Policy(PreTrainedPolicy):
         episode_indices = np.asarray(raw_frames["episode_index"], dtype=np.int64)
         frame_indices = np.asarray(raw_frames["frame_index"], dtype=np.int64)
         absolute_indices = np.asarray(raw_frames["index"], dtype=np.int64)
+        is_key_frame = (
+            np.asarray(raw_frames["is_key_frame"], dtype=np.bool_)
+            if "is_key_frame" in raw_frames.column_names
+            else np.zeros(frame_count, dtype=np.bool_)
+        )
 
         episodes_ds = dataset.meta.episodes.with_format(None)
         episodes = episodes_ds[:]
@@ -720,6 +852,23 @@ class Pistar06Policy(PreTrainedPolicy):
         max_index = int(np.max(absolute_indices))
         value_target_lookup = np.zeros(max_index + 1, dtype=np.float32)
         value_target_lookup[absolute_indices] = value_targets.astype(np.float32, copy=False)
+        stage_index_lookup = np.zeros(max_index + 1, dtype=np.int64)
+        stage_progress_lookup = np.zeros(max_index + 1, dtype=np.float32)
+        stage_value_lookup = np.zeros(max_index + 1, dtype=np.float32)
+        if self.config.enable_stage_heads:
+            stage_indices, stage_progress, stage_values = compute_keyframe_stage_targets(
+                episode_indices=episode_indices,
+                frame_indices=frame_indices,
+                is_key_frame=is_key_frame,
+            )
+            if int(np.max(stage_indices)) >= self.config.num_stage_classes:
+                raise ValueError(
+                    f"Dataset requires stage index {int(np.max(stage_indices))}, but "
+                    f"value.num_stage_classes={self.config.num_stage_classes}."
+                )
+            stage_index_lookup[absolute_indices] = stage_indices.astype(np.int64, copy=False)
+            stage_progress_lookup[absolute_indices] = stage_progress.astype(np.float32, copy=False)
+            stage_value_lookup[absolute_indices] = stage_values.astype(np.float32, copy=False)
 
         target_key = targets_cfg.target_field
 
@@ -734,6 +883,16 @@ class Pistar06Policy(PreTrainedPolicy):
             batch_indices_np = batch_indices.detach().cpu().numpy().astype(np.int64, copy=False).reshape(-1)
             target_values = torch.from_numpy(value_target_lookup[batch_indices_np]).to(dtype=torch.float32)
             batch[target_key] = target_values
+            if self.config.enable_stage_heads:
+                batch[self.config.stage_target_key] = torch.from_numpy(
+                    stage_index_lookup[batch_indices_np]
+                ).to(dtype=torch.long)
+                batch[self.config.stage_progress_target_key] = torch.from_numpy(
+                    stage_progress_lookup[batch_indices_np]
+                ).to(dtype=torch.float32)
+                batch[self.config.stage_value_target_key] = torch.from_numpy(
+                    stage_value_lookup[batch_indices_np]
+                ).to(dtype=torch.float32)
             return batch
 
         return value_target_hook
@@ -763,7 +922,7 @@ class Pistar06Policy(PreTrainedPolicy):
                 f"for key '{self.config.target_key}'."
             )
 
-        logits = self.model(
+        model_outputs = self.model.forward_outputs(
             input_ids=input_ids,
             attention_mask=attention_mask,
             images=images,
@@ -771,9 +930,61 @@ class Pistar06Policy(PreTrainedPolicy):
         )
 
         bin_centers = self.bin_centers.to(device=device)
+        logits = model_outputs["value_logits"]
         soft_target = project_values_to_bins(value_target, bin_centers)
         log_probs = functional.log_softmax(logits, dim=-1)
         per_sample_loss = -(soft_target * log_probs).sum(dim=-1)
+        value_loss = per_sample_loss
+
+        stage_loss = None
+        stage_progress_loss = None
+        stage_value_loss = None
+        if self.config.enable_stage_heads:
+            if self.config.stage_target_key not in batch:
+                raise KeyError(f"Missing stage target key '{self.config.stage_target_key}' in batch.")
+            if self.config.stage_progress_target_key not in batch:
+                raise KeyError(f"Missing stage progress target key '{self.config.stage_progress_target_key}' in batch.")
+            if self.config.stage_value_target_key not in batch:
+                raise KeyError(f"Missing stage value target key '{self.config.stage_value_target_key}' in batch.")
+
+            stage_target = batch[self.config.stage_target_key]
+            if not isinstance(stage_target, Tensor):
+                stage_target = torch.as_tensor(stage_target)
+            stage_target = stage_target.to(device=device, dtype=torch.long, non_blocking=True)
+            if stage_target.ndim == 2 and stage_target.shape[-1] == 1:
+                stage_target = stage_target.squeeze(-1)
+            if stage_target.ndim != 1:
+                raise ValueError(f"Stage target must be rank-1 or [B,1], got {tuple(stage_target.shape)}.")
+
+            stage_progress_target = batch[self.config.stage_progress_target_key]
+            if not isinstance(stage_progress_target, Tensor):
+                stage_progress_target = torch.as_tensor(stage_progress_target)
+            stage_progress_target = stage_progress_target.to(device=device, dtype=torch.float32, non_blocking=True)
+            if stage_progress_target.ndim == 2 and stage_progress_target.shape[-1] == 1:
+                stage_progress_target = stage_progress_target.squeeze(-1)
+
+            stage_value_target = batch[self.config.stage_value_target_key]
+            if not isinstance(stage_value_target, Tensor):
+                stage_value_target = torch.as_tensor(stage_value_target)
+            stage_value_target = stage_value_target.to(device=device, dtype=torch.float32, non_blocking=True)
+            if stage_value_target.ndim == 2 and stage_value_target.shape[-1] == 1:
+                stage_value_target = stage_value_target.squeeze(-1)
+
+            stage_loss = functional.cross_entropy(
+                model_outputs["stage_logits"], stage_target, reduction="none"
+            )
+            stage_progress_loss = functional.mse_loss(
+                model_outputs["stage_progress"], stage_progress_target, reduction="none"
+            )
+            stage_value_soft_target = project_values_to_bins(stage_value_target, bin_centers)
+            stage_value_log_probs = functional.log_softmax(model_outputs["stage_value_logits"], dim=-1)
+            stage_value_loss = -(stage_value_soft_target * stage_value_log_probs).sum(dim=-1)
+            per_sample_loss = (
+                per_sample_loss
+                + self.config.stage_loss_weight * stage_loss
+                + self.config.stage_progress_loss_weight * stage_progress_loss
+                + self.config.stage_value_loss_weight * stage_value_loss
+            )
 
         sample_weight = None
         if self.config.loss_weight_key in batch:
@@ -805,7 +1016,18 @@ class Pistar06Policy(PreTrainedPolicy):
             if reduction == "none"
             else float(loss.detach().item()),
             "value_mae": float(value_mae.detach().item()),
+            "value_loss": float(value_loss.mean().detach().item()),
         }
+        if stage_loss is not None and stage_progress_loss is not None and stage_value_loss is not None:
+            pred_stage = torch.argmax(model_outputs["stage_logits"], dim=-1)
+            stage_acc = (pred_stage == stage_target).to(dtype=torch.float32).mean()
+            pred_stage_value = expected_value_from_logits(model_outputs["stage_value_logits"], bin_centers)
+            stage_value_mae = (pred_stage_value - stage_value_target).abs().mean()
+            loss_dict["stage_loss"] = float(stage_loss.mean().detach().item())
+            loss_dict["stage_acc"] = float(stage_acc.detach().item())
+            loss_dict["stage_progress_loss"] = float(stage_progress_loss.mean().detach().item())
+            loss_dict["stage_value_loss"] = float(stage_value_loss.mean().detach().item())
+            loss_dict["stage_value_mae"] = float(stage_value_mae.detach().item())
         if sample_weight is not None:
             loss_dict["loss_weight_mean"] = float(sample_weight.mean().detach().item())
             loss_dict["loss_weight_min"] = float(sample_weight.min().detach().item())

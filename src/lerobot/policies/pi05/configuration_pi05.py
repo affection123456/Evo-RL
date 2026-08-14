@@ -38,8 +38,19 @@ class PI05Config(PreTrainedConfig):
     n_action_steps: int = 50  # Number of action steps to execute
 
     # Shorter state and action vectors will be padded to these dimensions
+    # (OpenPI / main pi05 default: 32). With use_rot6d=True, EE quat is converted
+    # to Rot6D [r1,r2] then clipped/padded to these dims.
     max_state_dim: int = 32
     max_action_dim: int = 32
+
+    # Historical dual-arm layout:
+    # [left xyz3, left Rot6D6, right xyz3, right Rot6D6, raw tail], then pad/clip.
+    use_rot6d: bool = True
+    # Absolute Rot6D by default (matches main pi05; no delta state/action).
+    # Set True for pose-only delta vs state (requires matching delta action stats).
+    rot6d_delta_action: bool = False
+    ee_state_key: str = "observation.ee_state"
+    ee_action_key: str = "observation.ee_actions"
 
     # Flow matching parameters: see openpi `PI0Pytorch`
     num_inference_steps: int = 10
@@ -99,6 +110,16 @@ class PI05Config(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if self.use_rot6d:
+            if self.max_state_dim < 18:
+                raise ValueError(
+                    f"use_rot6d requires max_state_dim >= 18 for dual-arm xyz+rot6d, got {self.max_state_dim}"
+                )
+            if self.max_action_dim < 18:
+                raise ValueError(
+                    f"use_rot6d requires max_action_dim >= 18 for dual-arm xyz+rot6d, got {self.max_action_dim}"
+                )
 
         # Validate configuration
         if self.n_action_steps > self.chunk_size:

@@ -168,7 +168,7 @@ def test_pistar06_processor_pads_missing_cameras_and_tokenizes(hf_stubs):
 
     raw_batch = {
         "task": ["pick bottle", "place bottle"],
-        OBS_STATE: torch.rand(2, 12),
+        OBS_STATE: torch.rand(2, 14),
         "observation.images.front": torch.rand(2, 3, 48, 40),
     }
     processed = preprocessor(raw_batch)
@@ -186,7 +186,7 @@ def test_pistar06_processor_requires_task_field(hf_stubs):
     preprocessor, _ = make_pistar06_pre_post_processors(cfg)
 
     with pytest.raises(KeyError, match="Missing task field"):
-        preprocessor({OBS_STATE: torch.rand(2, 12), "observation.images.front": torch.rand(2, 3, 48, 40)})
+        preprocessor({OBS_STATE: torch.rand(2, 14), "observation.images.front": torch.rand(2, 3, 48, 40)})
 
 
 def test_pistar06_processor_can_disable_state_in_prompt(hf_stubs):

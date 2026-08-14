@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as functional
 from torch import Tensor
 
-from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
     DeviceProcessorStep,
     NormalizerProcessorStep,
@@ -22,18 +22,88 @@ from lerobot.processor import (
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
 )
-from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+from lerobot.processor.converters import create_transition, policy_action_to_transition, transition_to_policy_action
 from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
+    ACTION,
+    DONE,
     OBS_IMAGES,
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
+    REWARD,
+    TRUNCATED,
 )
 from lerobot.values.pistar06.configuration_pistar06 import Pistar06Config
 
 PISTAR06_IMAGES_KEY = "observation.pistar06.images"
 PISTAR06_IMAGE_MASK_KEY = "observation.pistar06.image_attention_mask"
+
+
+# Bare DMP video/state keys → canonical LeRobot observation.* names.
+_PISTAR06_RAW_TO_CANONICAL = {
+    "ee_state": OBS_STATE,
+    "ref_ee_state": "observation.reference.state",
+    "top_head": f"{OBS_IMAGES}.top_head",
+    "hand_right": f"{OBS_IMAGES}.hand_right",
+    "hand_left": f"{OBS_IMAGES}.hand_left",
+    "ref_top_head": f"{OBS_IMAGES}.ref_top_head",
+    "ref_hand_right": f"{OBS_IMAGES}.ref_hand_right",
+    "ref_hand_left": f"{OBS_IMAGES}.ref_hand_left",
+}
+
+
+def pistar06_batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
+    control_keys = {ACTION, REWARD, DONE, TRUNCATED, "info"}
+    complementary_keys = {"task", "subtask", "index", "task_index", "episode_index", "frame_index"}
+    observation = {key: value for key, value in batch.items() if key not in control_keys | complementary_keys}
+    for raw_key, canonical_key in _PISTAR06_RAW_TO_CANONICAL.items():
+        if raw_key in batch and canonical_key not in observation:
+            observation[canonical_key] = batch[raw_key]
+    complementary_data = {key: batch[key] for key in complementary_keys if key in batch}
+    return create_transition(
+        observation=observation,
+        action=batch.get(ACTION),
+        reward=batch.get(REWARD, 0.0),
+        done=batch.get(DONE, False),
+        truncated=batch.get(TRUNCATED, False),
+        info=batch.get("info", {}),
+        complementary_data=complementary_data,
+    )
+
+
+def _quat_to_matrix(quat: Tensor) -> Tensor:
+    quat = quat.to(dtype=torch.float32)
+    quat = quat / quat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    x, y, z, w = quat.unbind(dim=-1)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    row0 = torch.stack([1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)], dim=-1)
+    row1 = torch.stack([2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)], dim=-1)
+    row2 = torch.stack([2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)], dim=-1)
+    return torch.stack([row0, row1, row2], dim=-2)
+
+
+def _matrix_first_two_cols_to_rot6d(matrix: Tensor) -> Tensor:
+    """Flatten the first two rotation-matrix columns as ``[col0, col1]``."""
+    return torch.cat([matrix[..., :, 0], matrix[..., :, 1]], dim=-1)
+
+
+def _quat_pose_to_rot6d(x: Tensor) -> Tensor:
+    if x.shape[-1] < 14:
+        raise ValueError(f"Expected last dim >= 14 for dual-arm xyz+quat layout, got {tuple(x.shape)}")
+    left = _matrix_first_two_cols_to_rot6d(_quat_to_matrix(x[..., 3:7]))
+    right = _matrix_first_two_cols_to_rot6d(_quat_to_matrix(x[..., 10:14]))
+    return torch.cat([x[..., :3], left, x[..., 7:10], right, x[..., 14:]], dim=-1)
+
+
+def _pad_or_clip_last_dim(x: Tensor, dim: int) -> Tensor:
+    if x.shape[-1] > dim:
+        return x[..., :dim]
+    if x.shape[-1] < dim:
+        return functional.pad(x, (0, dim - x.shape[-1]))
+    return x
 
 
 def _pad_last_dim(vector: Tensor, new_dim: int) -> Tensor:
@@ -42,12 +112,48 @@ def _pad_last_dim(vector: Tensor, new_dim: int) -> Tensor:
     return functional.pad(vector, (0, new_dim - vector.shape[-1]))
 
 
+@ProcessorStepRegistry.register(name="pistar06_rot6d_state_processor")
+@dataclass
+class Pistar06Rot6DStateProcessorStep(ProcessorStep):
+    state_feature: str = OBS_STATE
+    ref_state_feature: str = "observation.reference.state"
+    max_state_dim: int = 32
+    use_rot6d: bool = True
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "state_feature": self.state_feature,
+            "ref_state_feature": self.ref_state_feature,
+            "max_state_dim": self.max_state_dim,
+            "use_rot6d": self.use_rot6d,
+        }
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        transition = transition.copy()
+        observation = dict(transition.get(TransitionKey.OBSERVATION) or {})
+        for key in (self.state_feature, self.ref_state_feature):
+            if key in observation:
+                value = torch.as_tensor(observation[key])
+                if self.use_rot6d:
+                    value = _quat_pose_to_rot6d(value)
+                observation[key] = _pad_or_clip_last_dim(value, self.max_state_dim)
+        transition[TransitionKey.OBSERVATION] = observation
+        return transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
 @ProcessorStepRegistry.register(name="pistar06_prepare_task_prompt")
 @dataclass
 class Pistar06PrepareTaskPromptProcessorStep(ProcessorStep):
     task_key: str = "task"
     include_state_in_prompt: bool = True
+    include_ref_state_in_prompt: bool = True
     state_feature: str = OBS_STATE
+    ref_state_feature: str = "observation.reference.state"
     max_state_dim: int = 32
     state_discretization_bins: int = 256
 
@@ -55,7 +161,9 @@ class Pistar06PrepareTaskPromptProcessorStep(ProcessorStep):
         return {
             "task_key": self.task_key,
             "include_state_in_prompt": self.include_state_in_prompt,
+            "include_ref_state_in_prompt": self.include_ref_state_in_prompt,
             "state_feature": self.state_feature,
+            "ref_state_feature": self.ref_state_feature,
             "max_state_dim": self.max_state_dim,
             "state_discretization_bins": self.state_discretization_bins,
         }
@@ -81,13 +189,12 @@ class Pistar06PrepareTaskPromptProcessorStep(ProcessorStep):
                 f"Expected task field '{self.task_key}' as sequence of strings, got {type(tasks_raw)}."
             )
 
-        prompts: list[str] = []
-        if self.include_state_in_prompt:
-            if self.state_feature not in observation:
-                raise KeyError(
-                    f"Missing state feature '{self.state_feature}' while include_state_in_prompt=True."
-                )
-            state = observation[self.state_feature]
+        def discretize_state(feature: str, *, required: bool) -> np.ndarray | None:
+            if feature not in observation:
+                if required:
+                    raise KeyError(f"Missing state feature '{feature}' while building value prompt.")
+                return None
+            state = observation[feature]
             if not isinstance(state, Tensor):
                 state = torch.as_tensor(state)
 
@@ -96,24 +203,45 @@ class Pistar06PrepareTaskPromptProcessorStep(ProcessorStep):
             if state.ndim != 2:
                 raise ValueError(
                     f"Expected state tensor with shape [B, D], got {tuple(state.shape)} "
-                    f"for feature '{self.state_feature}'."
+                    f"for feature '{feature}'."
                 )
 
             state = state.detach().to(dtype=torch.float32, device="cpu")
             state = _pad_last_dim(state, self.max_state_dim)
             state_np = state.numpy()
             bins = np.linspace(-1.0, 1.0, self.state_discretization_bins + 1, dtype=np.float32)[:-1]
-            discretized_state = np.digitize(state_np, bins=bins) - 1
+            return np.digitize(state_np, bins=bins) - 1
+
+        prompts: list[str] = []
+        if self.include_state_in_prompt:
+            discretized_state = discretize_state(self.state_feature, required=True)
+            discretized_ref_state = (
+                discretize_state(self.ref_state_feature, required=False)
+                if self.include_ref_state_in_prompt
+                else None
+            )
+            if discretized_state is None:
+                raise RuntimeError("State discretization unexpectedly returned None.")
 
             if discretized_state.shape[0] != len(tasks):
                 raise ValueError(
                     f"Task count ({len(tasks)}) does not match state batch size ({discretized_state.shape[0]})."
                 )
+            if discretized_ref_state is not None and discretized_ref_state.shape[0] != len(tasks):
+                raise ValueError(
+                    f"Task count ({len(tasks)}) does not match ref state batch size ({discretized_ref_state.shape[0]})."
+                )
 
             for i, task in enumerate(tasks):
                 cleaned_task = self._clean_prompt(task)
                 state_str = " ".join(map(str, discretized_state[i].tolist()))
-                prompts.append(f"Task: {cleaned_task}, State: {state_str}\nValue: ")
+                if discretized_ref_state is None:
+                    prompts.append(f"Task: {cleaned_task}, State: {state_str}\nValue: ")
+                else:
+                    ref_state_str = " ".join(map(str, discretized_ref_state[i].tolist()))
+                    prompts.append(
+                        f"Task: {cleaned_task}, State: {state_str}, Reference State: {ref_state_str}\nValue: "
+                    )
         else:
             prompts = [f"Task: {self._clean_prompt(task)}\nValue: " for task in tasks]
 
@@ -252,20 +380,54 @@ def make_pistar06_pre_post_processors(
 ]:
     camera_features = list(config.camera_features)
     if not camera_features:
-        camera_features = [k for k in (config.input_features or {}) if k.startswith(OBS_IMAGES)]
+        for key in config.input_features or {}:
+            if key.startswith(f"{OBS_IMAGES}."):
+                camera_features.append(key)
+            elif key in _PISTAR06_RAW_TO_CANONICAL and not key.startswith("ref_"):
+                # DMP meta exposes bare video keys; map to observation.images.*.
+                # Reference cameras are appended from config.reference_camera_features.
+                canon = _PISTAR06_RAW_TO_CANONICAL[key]
+                if canon.startswith(f"{OBS_IMAGES}.") and canon not in camera_features:
+                    camera_features.append(canon)
+    for key in config.reference_camera_features:
+        if key not in camera_features:
+            camera_features.append(key)
+
+    processor_features = {**(config.input_features or {}), **(config.output_features or {})}
+    for key in (config.state_feature, config.ref_state_feature):
+        if key and key not in processor_features:
+            stat_shape = None
+            if dataset_stats and key in dataset_stats and "mean" in dataset_stats[key]:
+                stat_shape = tuple(torch.as_tensor(dataset_stats[key]["mean"]).shape)
+            processor_features[key] = PolicyFeature(
+                type=FeatureType.STATE,
+                shape=stat_shape if stat_shape else (config.max_state_dim,),
+            )
+
+    normalize_observation_keys = {config.state_feature}
+    if config.include_ref_state_in_prompt and config.ref_state_feature:
+        normalize_observation_keys.add(config.ref_state_feature)
 
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),
+        Pistar06Rot6DStateProcessorStep(
+            state_feature=config.state_feature,
+            ref_state_feature=config.ref_state_feature,
+            max_state_dim=config.max_state_dim,
+            use_rot6d=bool(getattr(config, "use_rot6d", True)),
+        ),
         NormalizerProcessorStep(
-            features={**(config.input_features or {}), **(config.output_features or {})},
+            features=processor_features,
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
-            normalize_observation_keys={config.state_feature},
+            normalize_observation_keys=normalize_observation_keys,
         ),
         Pistar06PrepareTaskPromptProcessorStep(
             task_key=config.task_field,
             include_state_in_prompt=config.include_state_in_prompt,
+            include_ref_state_in_prompt=config.include_ref_state_in_prompt,
             state_feature=config.state_feature,
+            ref_state_feature=config.ref_state_feature,
             max_state_dim=config.max_state_dim,
             state_discretization_bins=config.state_discretization_bins,
         ),
@@ -289,6 +451,7 @@ def make_pistar06_pre_post_processors(
         PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
             steps=input_steps,
             name=POLICY_PREPROCESSOR_DEFAULT_NAME,
+            to_transition=pistar06_batch_to_transition,
         ),
         PolicyProcessorPipeline[PolicyAction, PolicyAction](
             steps=output_steps,

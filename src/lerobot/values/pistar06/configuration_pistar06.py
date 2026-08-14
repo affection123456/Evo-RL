@@ -23,13 +23,25 @@ class Pistar06Config(PreTrainedConfig):
     # Input fields
     task_field: str = "task"
     camera_features: list[str] = field(default_factory=list)
+    reference_camera_features: list[str] = field(default_factory=list)
     state_feature: str = OBS_STATE
+    ref_state_feature: str = "observation.reference.state"
     include_state_in_prompt: bool = True
+    include_ref_state_in_prompt: bool = False
+    # Historical full32 dual-arm Rot6D state representation.
+    use_rot6d: bool = True
+    # Deprecated checkpoint alias. None means use ``use_rot6d``.
+    use_rot6d_state: bool | None = None
     max_state_dim: int = 32
     state_discretization_bins: int = 256
     target_key: str = "observation.value_target"
     loss_weight_key: str = "observation.value_loss_weight"
     task_index_feature: str = "task_index"
+
+    # Optional stage supervision targets injected by lerobot-value-train.
+    stage_target_key: str = "observation.ref_stage_index_target"
+    stage_progress_target_key: str = "observation.ref_stage_progress_target"
+    stage_value_target_key: str = "observation.ref_stage_value_target"
 
     # Tokenizer / model shape
     tokenizer_max_length: int = 200
@@ -42,6 +54,11 @@ class Pistar06Config(PreTrainedConfig):
     num_bins: int = 201
     bin_min: float = -1.0
     bin_max: float = 0.0
+    enable_stage_heads: bool = False
+    num_stage_classes: int = 8
+    stage_loss_weight: float = 1.0
+    stage_progress_loss_weight: float = 1.0
+    stage_value_loss_weight: float = 1.0
 
     # Runtime
     dropout: float = 0.1
@@ -70,6 +87,13 @@ class Pistar06Config(PreTrainedConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
 
+        if self.use_rot6d_state is not None:
+            object.__setattr__(self, "use_rot6d", bool(self.use_rot6d_state))
+        if self.use_rot6d and self.max_state_dim < 18:
+            raise ValueError(
+                f"'value.max_state_dim'={self.max_state_dim} must be at least 18 for dual-arm xyz+rot6d"
+            )
+
         if not self.vision_repo_id:
             raise ValueError("'value.vision_repo_id' must be non-empty.")
         if not self.language_repo_id:
@@ -80,6 +104,10 @@ class Pistar06Config(PreTrainedConfig):
             raise ValueError("'value.state_feature' must be non-empty.")
         if not self.state_feature.startswith("observation."):
             raise ValueError("'value.state_feature' must start with 'observation.'.")
+        if self.include_ref_state_in_prompt and not self.ref_state_feature:
+            raise ValueError("'value.ref_state_feature' must be non-empty when reference state prompting is enabled.")
+        if self.ref_state_feature and not self.ref_state_feature.startswith("observation."):
+            raise ValueError("'value.ref_state_feature' must start with 'observation.'.")
         if not self.target_key:
             raise ValueError("'value.target_key' must be non-empty.")
         if not self.loss_weight_key:
@@ -108,6 +136,10 @@ class Pistar06Config(PreTrainedConfig):
             raise ValueError("'value.num_bins' must be >= 2.")
         if self.bin_min >= self.bin_max:
             raise ValueError("'value.bin_min' must be < 'value.bin_max'.")
+        if self.num_stage_classes < 1:
+            raise ValueError("'value.num_stage_classes' must be >= 1.")
+        if self.stage_loss_weight < 0 or self.stage_progress_loss_weight < 0 or self.stage_value_loss_weight < 0:
+            raise ValueError("Stage loss weights must be non-negative.")
         if self.dtype not in {"float32", "bfloat16"}:
             raise ValueError("'value.dtype' must be one of {'float32', 'bfloat16'}.")
         if not 0.0 <= self.dropout < 1.0:
