@@ -217,6 +217,36 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     return padded_images
 
 
+def _apply_layer_norm_with_optional_cond(
+    norm_layer: nn.Module, hidden_states: torch.Tensor, cond: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Support both AdARMS norms with cond and plain GemmaRMSNorm."""
+    if cond is not None:
+        try:
+            norm_out = norm_layer(hidden_states, cond=cond)
+        except TypeError:
+            norm_out = norm_layer(hidden_states)
+    else:
+        norm_out = norm_layer(hidden_states)
+
+    if isinstance(norm_out, tuple):
+        return norm_out
+    return norm_out, None
+
+
+def _apply_gated_residual_compat(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor | None
+) -> torch.Tensor:
+    """Support transformers versions/checkpoints with or without gated residuals."""
+    gated_residual_fn = getattr(modeling_gemma, "_gated_residual", None)
+    if gated_residual_fn is not None:
+        return gated_residual_fn(residual, update, gate)
+
+    if gate is None:
+        return residual + update
+    return residual + gate.to(dtype=update.dtype) * update
+
+
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
@@ -228,7 +258,9 @@ def compute_layer_complete(
     gates = []
     for i, hidden_states in enumerate(inputs_embeds):
         layer = models[i].layers[layer_idx]
-        hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+        hidden_states, gate = _apply_layer_norm_with_optional_cond(
+            layer.input_layernorm, hidden_states, adarms_cond[i]
+        )
         gates.append(gate)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
@@ -277,15 +309,17 @@ def compute_layer_complete(
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
         out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
         # first residual
-        out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+        out_emb = _apply_gated_residual_compat(hidden_states, out_emb, gates[i])
         after_first_residual = out_emb.clone()
-        out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+        out_emb, gate = _apply_layer_norm_with_optional_cond(
+            layer.post_attention_layernorm, out_emb, adarms_cond[i]
+        )
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
         if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
         out_emb = layer.mlp(out_emb)
         # second residual
-        out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+        out_emb = _apply_gated_residual_compat(after_first_residual, out_emb, gate)
         outputs_embeds.append(out_emb)
         start_pos = end_pos
     return outputs_embeds
@@ -399,6 +433,10 @@ class PaliGemmaWithExpertModel(
             raise ValueError(f"Invalid precision: {precision}")
 
         params_to_keep_float32 = [
+            # Keep full SigLIP tower in fp32 for dtype-stable LayerNorm on some transformers versions.
+            "vision_tower",
+            # Keep projector aligned with vision output dtype (fp32) to avoid Float/BFloat16 matmul mismatch.
+            "multi_modal_projector",
             "vision_tower.vision_model.embeddings.patch_embedding.weight",
             "vision_tower.vision_model.embeddings.patch_embedding.bias",
             "vision_tower.vision_model.embeddings.position_embedding.weight",
@@ -429,6 +467,13 @@ class PaliGemmaWithExpertModel(
             self.paligemma.eval()
 
     def embed_image(self, image: torch.Tensor):
+        # Avoid dtype mismatch under external autocast (e.g., accelerate bf16 mixed precision).
+        # Keep image dtype aligned with vision tower parameters and run vision forward without autocast.
+        vision_dtype = self.paligemma.model.vision_tower.vision_model.embeddings.patch_embedding.weight.dtype
+        image = image.to(dtype=vision_dtype)
+        if image.device.type in {"cuda", "cpu", "xpu", "mps"}:
+            with torch.autocast(device_type=image.device.type, enabled=False):
+                return self.paligemma.model.get_image_features(image)
         return self.paligemma.model.get_image_features(image)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
@@ -510,7 +555,9 @@ class PaliGemmaWithExpertModel(
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                    out_emb, _ = _apply_layer_norm_with_optional_cond(
+                        models[i].norm, hidden_states, adarms_cond[i]
+                    )
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
 

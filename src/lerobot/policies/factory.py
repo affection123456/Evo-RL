@@ -24,7 +24,7 @@ import torch
 from typing_extensions import Unpack
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import FeatureType
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.envs.configs import EnvConfig
@@ -34,6 +34,7 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.evo1.configuration_evo1 import Evo1Config
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
+from lerobot.policies.pi0_dmp.configuration_pi0_dmp import PI0DMPConfig
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
@@ -54,6 +55,8 @@ from lerobot.processor.converters import (
 )
 from lerobot.utils.constants import (
     ACTION,
+    OBS_IMAGES,
+    OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
@@ -96,6 +99,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pi0.modeling_pi0 import PI0Policy
 
         return PI0Policy
+    elif name == "pi0_dmp":
+        from lerobot.policies.pi0_dmp.modeling_pi0_dmp import PI0DMPPolicy
+
+        return PI0DMPPolicy
     elif name == "pi0_fast":
         from lerobot.policies.pi0_fast.modeling_pi0_fast import PI0FastPolicy
 
@@ -172,6 +179,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return VQBeTConfig(**kwargs)
     elif policy_type == "pi0":
         return PI0Config(**kwargs)
+    elif policy_type == "pi0_dmp":
+        return PI0DMPConfig(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
     elif policy_type == "evo1":
@@ -248,6 +257,88 @@ def make_pre_post_processors(
         NotImplementedError: If a processor factory is not implemented for the given
             policy configuration type.
     """
+    if isinstance(policy_cfg, PI0DMPConfig):
+        from lerobot.policies.pi0_dmp.processor_pi0_dmp import make_pi0_dmp_pre_post_processors
+        from lerobot.policies.pi0_dmp.processor_pi0_dmp import pi0_dmp_batch_to_transition
+
+        if pretrained_path and kwargs.get("dataset_stats") is None:
+            preprocessor_overrides = dict(kwargs.get("preprocessor_overrides") or {})
+            # PI0-DMP's preprocessor packs raw DMP keys itself, so a generic rename step is not present.
+            preprocessor_overrides.pop("rename_observations_processor", None)
+            return (
+                PolicyProcessorPipeline.from_pretrained(
+                    pretrained_model_name_or_path=pretrained_path,
+                    config_filename=kwargs.get(
+                        "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
+                    ),
+                    overrides=preprocessor_overrides,
+                    to_transition=pi0_dmp_batch_to_transition,
+                    to_output=transition_to_batch,
+                ),
+                PolicyProcessorPipeline.from_pretrained(
+                    pretrained_model_name_or_path=pretrained_path,
+                    config_filename=kwargs.get(
+                        "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
+                    ),
+                    overrides=kwargs.get("postprocessor_overrides", {}),
+                    to_transition=policy_action_to_transition,
+                    to_output=transition_to_policy_action,
+                ),
+            )
+
+        return make_pi0_dmp_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    # pi05 + Rot6D: at train time we may rebuild processors from dataset_stats.
+    # At inference, dataset_stats is typically unset — must load the checkpoint's
+    # preprocessor/postprocessor (with QUANTILES stats). Otherwise Unnormalizer has
+    # empty stats and actions stay in normalized space (huge action0 vs state gap).
+    if isinstance(policy_cfg, PI05Config) and getattr(policy_cfg, "use_rot6d", False):
+        from lerobot.policies.pi05.processor_pi05 import (
+            make_pi05_pre_post_processors,
+            pi05_batch_to_transition,
+        )
+
+        if pretrained_path and kwargs.get("dataset_stats") is None:
+            preprocessor_overrides = dict(kwargs.get("preprocessor_overrides") or {})
+            return (
+                PolicyProcessorPipeline.from_pretrained(
+                    pretrained_model_name_or_path=pretrained_path,
+                    config_filename=kwargs.get(
+                        "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
+                    ),
+                    overrides=preprocessor_overrides,
+                    to_transition=pi05_batch_to_transition,
+                    to_output=transition_to_batch,
+                ),
+                PolicyProcessorPipeline.from_pretrained(
+                    pretrained_model_name_or_path=pretrained_path,
+                    config_filename=kwargs.get(
+                        "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
+                    ),
+                    overrides=kwargs.get("postprocessor_overrides", {}),
+                    to_transition=policy_action_to_transition,
+                    to_output=transition_to_policy_action,
+                ),
+            )
+
+        return make_pi05_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    from lerobot.values.pistar06.configuration_pistar06 import Pistar06Config
+
+    if isinstance(policy_cfg, Pistar06Config):
+        from lerobot.values.pistar06.processor_pistar06 import make_pistar06_pre_post_processors
+
+        return make_pistar06_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
     if pretrained_path:
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
@@ -482,9 +573,48 @@ def make_policy(
             raise ValueError("env_cfg cannot be None when ds_meta is not provided")
         features = env_to_policy_features(env_cfg)
 
-    cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    if not cfg.input_features:
-        cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+    if isinstance(cfg, PI0DMPConfig):
+        # DMP datasets store raw fields such as ``ee_state`` / ``ee_actions``.
+        # The PI0-DMP processor repacks them into canonical policy keys and converts
+        # quat poses to Rot6D, so expose the post-processor feature space here.
+        cfg.input_features = {
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(cfg.max_state_dim,)),
+            cfg.ref_state_key: PolicyFeature(type=FeatureType.STATE, shape=(cfg.max_state_dim,)),
+            # Stored under observation, but normalized with its own stats before being used as flow noise.
+            cfg.ref_action_key: PolicyFeature(type=FeatureType.STATE, shape=(cfg.max_action_dim,)),
+            "observation.images.top_head": PolicyFeature(type=FeatureType.VISUAL, shape=(3, *cfg.image_resolution)),
+            "observation.images.hand_right": PolicyFeature(
+                type=FeatureType.VISUAL, shape=(3, *cfg.image_resolution)
+            ),
+            cfg.ref_image_features[0]: PolicyFeature(type=FeatureType.VISUAL, shape=(3, *cfg.image_resolution)),
+            cfg.ref_image_features[1]: PolicyFeature(type=FeatureType.VISUAL, shape=(3, *cfg.image_resolution)),
+        }
+        cfg.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(cfg.max_action_dim,))}
+    elif isinstance(cfg, PI05Config) and getattr(cfg, "use_rot6d", False):
+        # pi05 Rot6D path: processor maps observation.ee_* (quat) → observation.state / action (rot6d).
+        # Canonicalize visual keys so DMP bare names (top_head) and basket
+        # observation.images.* both feed image_features consistently.
+        cfg.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(cfg.max_action_dim,))}
+        visual_features: dict[str, PolicyFeature] = {}
+        for key, ft in features.items():
+            if ft.type is not FeatureType.VISUAL:
+                continue
+            if key.startswith(f"{OBS_IMAGES}."):
+                canon_key = key
+            elif key.startswith("ref_"):
+                # pi05 does not consume DMP reference cameras.
+                continue
+            else:
+                canon_key = f"{OBS_IMAGES}.{key}"
+            visual_features[canon_key] = ft
+        cfg.input_features = {
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(cfg.max_state_dim,)),
+            **visual_features,
+        }
+    else:
+        cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+        if not cfg.input_features:
+            cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
     kwargs["config"] = cfg
 
     # Pass dataset_stats to the policy if available (needed for some policies like SARM)

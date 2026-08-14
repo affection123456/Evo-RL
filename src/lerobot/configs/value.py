@@ -70,6 +70,11 @@ class ValueInferenceACPConfig:
     value_field: str = "complementary_info.value"
     advantage_field: str = "complementary_info.advantage"
     indicator_field: str = "complementary_info.acp_indicator"
+    emit_ref_stage: bool = False
+    ref_stage_field: str = "complementary_info.ref_stage"
+    ref_stage_index_field: str = "complementary_info.ref_stage_index"
+    ref_stage_progress_field: str = "complementary_info.ref_stage_progress"
+    ref_stage_value_field: str = "complementary_info.ref_stage_value"
 
     c_fail_coef: float = 1.0
 
@@ -85,6 +90,16 @@ class ValueInferenceACPConfig:
         if self.enable and (not self.advantage_field or not self.indicator_field):
             raise ValueError(
                 "'acp.advantage_field' and 'acp.indicator_field' must be non-empty when 'acp.enable=true'."
+            )
+        if self.emit_ref_stage and (
+            not self.ref_stage_field
+            or not self.ref_stage_index_field
+            or not self.ref_stage_progress_field
+            or not self.ref_stage_value_field
+        ):
+            raise ValueError(
+                "'acp.ref_stage_field', 'acp.ref_stage_index_field', 'acp.ref_stage_progress_field', "
+                "and 'acp.ref_stage_value_field' must be non-empty when 'acp.emit_ref_stage=true'."
             )
 
 

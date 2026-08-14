@@ -17,6 +17,7 @@ from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfi
 from .evo1.configuration_evo1 import Evo1Config as Evo1Config
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
+from .pi0_dmp.configuration_pi0_dmp import PI0DMPConfig as PI0DMPConfig
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
@@ -31,6 +32,7 @@ __all__ = [
     "DiffusionConfig",
     "Evo1Config",
     "PI0Config",
+    "PI0DMPConfig",
     "PI05Config",
     "PI0FastConfig",
     "SmolVLAConfig",
