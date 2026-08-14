@@ -68,6 +68,21 @@ def _resolve_pretrained_model_path(policy_path: str) -> str:
     """If ``--policy.path`` points at a train step dir, use ``.../pretrained_model``."""
     raw = policy_path.strip()
     p = Path(raw).expanduser()
+    # Local-looking paths must exist; do not fall through to Hub (HFValidationError).
+    looks_local = (
+        raw.startswith((".", "/", "~"))
+        or raw.startswith("outputs/")
+        or "/" in raw
+        or "\\" in raw
+        or p.suffix in {".json", ".safetensors"}
+    )
+    if looks_local and not p.exists():
+        raise FileNotFoundError(
+            f"Checkpoint path does not exist: {p.resolve() if p.is_absolute() else p}. "
+            "Training may not have saved checkpoints yet, or the run dir was overwritten. "
+            "Pass an existing .../checkpoints/<step> or .../checkpoints/last "
+            f"(with {PRETRAINED_MODEL_DIR}/config.json), or a Hub repo id like 'org/name'."
+        )
     if not p.exists():
         return raw
     p = p.resolve()
@@ -156,13 +171,18 @@ def _decode_observation_payload(
         val = obs_in[client_key]
         is_visual = ft.type == FeatureType.VISUAL or "image" in policy_key or "image" in client_key
         if is_visual:
-            out[client_key] = np.ascontiguousarray(_decode_image_value(val))
+            decoded = np.ascontiguousarray(_decode_image_value(val))
         elif ft.type == FeatureType.LANGUAGE:
-            out[client_key] = _decode_numeric_or_token_list(val, as_language=True)
+            decoded = _decode_numeric_or_token_list(val, as_language=True)
         elif isinstance(val, list):
-            out[client_key] = np.asarray(val, dtype=np.float32).copy()
+            decoded = np.asarray(val, dtype=np.float32).copy()
         else:
             raise TypeError(f"Key '{client_key}': expected JSON list, got {type(val)}")
+        out[client_key] = decoded
+        if client_key != policy_key:
+            # Some policy-specific preprocessors (e.g. PI0-DMP) pack canonical keys directly
+            # instead of using a generic rename processor.
+            out[policy_key] = decoded
     return out
 
 
@@ -311,7 +331,7 @@ class _PolicySession:
             use_amp = bool(self.policy_cfg.use_amp)
 
         with amp_ctx:
-            return predict_action(
+            action = predict_action(
                 observation=copy(observation),
                 policy=self.policy,
                 device=self.device,
@@ -321,12 +341,61 @@ class _PolicySession:
                 task=task,
                 robot_type=self.robot_type,
             )
+            return _decode_policy_actions(action, observation, self.policy_cfg)
+
+    def infer_action_chunk(self, task: str | None, observation: dict[str, np.ndarray]) -> PolicyAction:
+        dtype = getattr(self.policy_cfg, "dtype", None)
+        if self.device.type == "cuda" and dtype in ("bfloat16", "bf16"):
+            amp_ctx: Any = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            use_amp = False
+        elif self.device.type == "cuda" and self.policy_cfg.use_amp:
+            amp_ctx = torch.autocast(device_type="cuda")
+            use_amp = False
+        else:
+            amp_ctx = nullcontext()
+            use_amp = bool(self.policy_cfg.use_amp)
+
+        with (
+            torch.inference_mode(),
+            amp_ctx,
+            torch.autocast(device_type=self.device.type) if self.device.type == "cuda" and use_amp else nullcontext(),
+        ):
+            from lerobot.policies.utils import prepare_observation_for_inference
+
+            processed = prepare_observation_for_inference(copy(observation), self.device, task, self.robot_type)
+            processed = self.preprocessor(processed)
+            action = self.policy.predict_action_chunk(processed)
+            action = self.postprocessor(action)
+            action = _decode_policy_actions(action, observation, self.policy_cfg)
+            if isinstance(action, torch.Tensor) and action.ndim >= 3 and action.shape[0] == 1:
+                action = action[0]
+            return action
 
 
 def _action_to_jsonable(action: PolicyAction) -> Any:
     if isinstance(action, torch.Tensor):
         return action.detach().cpu().tolist()
     return action
+
+
+def _decode_policy_actions(
+    actions: PolicyAction,
+    raw_observation: dict[str, np.ndarray],
+    policy_cfg: PreTrainedConfig,
+) -> PolicyAction:
+    if not isinstance(actions, torch.Tensor):
+        return actions
+
+    policy_type = getattr(policy_cfg, "type", None)
+    if policy_type == "pi0_dmp":
+        from lerobot.policies.pi0_dmp.processor_pi0_dmp import decode_pi0_dmp_policy_actions
+
+        return decode_pi0_dmp_policy_actions(actions, raw_observation, policy_cfg)
+    if policy_type == "pi05":
+        from lerobot.policies.pi05.processor_pi05 import decode_pi05_policy_actions
+
+        return decode_pi05_policy_actions(actions, raw_observation, policy_cfg)
+    return actions
 
 
 @parser.wrap()
@@ -356,10 +425,17 @@ def policy_infer_websocket(cfg: PolicyInferWebsocketConfig):
             try:
                 task = data.get("task")
                 obs = _decode_observation_payload(data, session.policy_cfg, session.rename_map)
-                action = session.infer(task=str(task) if task is not None else None, observation=obs)
+                if data.get("return_chunk", False):
+                    action = session.infer_action_chunk(
+                        task=str(task) if task is not None else None, observation=obs
+                    )
+                    response_key = "actions"
+                else:
+                    action = session.infer(task=str(task) if task is not None else None, observation=obs)
+                    response_key = "action"
                 logging.info("Infer action: %s", _action_to_jsonable(action))
                 await websocket.send(
-                    json.dumps({"ok": True, "action": _action_to_jsonable(action)}, allow_nan=False)
+                    json.dumps({"ok": True, response_key: _action_to_jsonable(action)}, allow_nan=False)
                 )
             except Exception as e:
                 logging.exception("Inference error")
