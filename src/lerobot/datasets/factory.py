@@ -30,6 +30,25 @@ from lerobot.datasets.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
 
 
+def _resolve_ee_action_feature_key(cfg: PreTrainedConfig, ds_meta: LeRobotDatasetMetadata) -> str | None:
+    """Return the dataset feature key for EE quat actions, if present.
+
+    Configs typically use the canonical ``observation.ee_actions`` name, but some
+    lerobotv3 / DMP datasets store the bare key ``ee_actions``. Prefer the
+    configured key, then fall back to the bare alias used by pi05 processors.
+    """
+    configured = getattr(cfg, "ee_action_key", "observation.ee_actions")
+    candidates = []
+    if isinstance(configured, str) and configured:
+        candidates.append(configured)
+    if "ee_actions" not in candidates:
+        candidates.append("ee_actions")
+    for key in candidates:
+        if key in ds_meta.features:
+            return key
+    return None
+
+
 def resolve_delta_timestamps(
     cfg: PreTrainedConfig, ds_meta: LeRobotDatasetMetadata
 ) -> dict[str, list] | None:
@@ -49,13 +68,21 @@ def resolve_delta_timestamps(
             returns `None` if the resulting dict is empty.
     """
     delta_timestamps = {}
+    use_rot6d = bool(getattr(cfg, "use_rot6d", False))
+    ee_action_feature_key = _resolve_ee_action_feature_key(cfg, ds_meta) if use_rot6d else None
+
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
+            # With pi05 Rot6D, temporal action chunks come from EE quat actions instead.
+            if ee_action_feature_key is None:
+                delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+
+    if ee_action_feature_key is not None and cfg.action_delta_indices is not None:
+        delta_timestamps[ee_action_feature_key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None

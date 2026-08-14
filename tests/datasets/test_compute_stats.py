@@ -29,11 +29,28 @@ from lerobot.datasets.compute_stats import (
     sample_images,
     sample_indices,
 )
+from lerobot.datasets.v30 import augment_dataset_quantile_stats as quantile_stats
 from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
 
 
 def mock_load_image_as_numpy(path, dtype, channel_first):
     return np.ones((3, 32, 32), dtype=dtype) if channel_first else np.ones((32, 32, 3), dtype=dtype)
+
+
+def test_quantile_stats_use_full32_dual_arm_rot6d_layout() -> None:
+    pose = np.zeros((2, 34), dtype=np.float32)
+    pose[..., 6] = 1.0
+    pose[..., 13] = 1.0
+    pose[..., 14:] = np.arange(20, dtype=np.float32)
+    converter = getattr(
+        quantile_stats,
+        "_quat_pose_to_rot6d",
+        lambda value: quantile_stats._ee_to_contract(
+            value, use_rot6d=True, arm_mode="both", gripper_dims=6
+        ),
+    )
+    actual = quantile_stats._pad_or_clip_last_dim(converter(pose), 32)
+    np.testing.assert_allclose(actual[..., 18:], pose[..., 14:28])
 
 
 @pytest.fixture
@@ -670,12 +687,10 @@ def test_aggregate_feature_stats_with_quantiles():
     assert "q01" in result
     assert "q99" in result
 
-    # Verify quantile aggregation (weighted average)
-    expected_q01 = (1.5 * 100 + 2.5 * 150) / 250  # ≈ 2.1
-    expected_q99 = (9.5 * 100 + 11.5 * 150) / 250  # ≈ 10.7
-
-    np.testing.assert_allclose(result["q01"], np.array([expected_q01]), atol=1e-6)
-    np.testing.assert_allclose(result["q99"], np.array([expected_q99]), atol=1e-6)
+    # Lower quantiles → min across episodes; upper → max (envelope).
+    # Weighted-averaging q01/q99 collapses span when episodes are near-constant.
+    np.testing.assert_allclose(result["q01"], np.array([1.5]), atol=1e-6)
+    np.testing.assert_allclose(result["q99"], np.array([11.5]), atol=1e-6)
 
 
 def test_aggregate_stats_mixed_quantiles():

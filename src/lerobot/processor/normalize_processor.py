@@ -331,11 +331,13 @@ class _NormalizationMixin:
                 )
 
             mean, std = stats["mean"], stats["std"]
-            # Avoid division by zero by adding a small epsilon.
-            denom = std + self.eps
+            # Near-constant dims (std≈0): map to 0 instead of dividing by eps, which
+            # amplifies float noise / rare outliers into 1e8–1e10 and explodes training loss.
+            constant = std <= self.eps
+            denom = torch.where(constant, torch.ones_like(std), std)
             if inverse:
-                return tensor * std + mean
-            return (tensor - mean) / denom
+                return torch.where(constant, mean.expand_as(tensor), tensor * std + mean)
+            return torch.where(constant, torch.zeros_like(tensor), (tensor - mean) / denom)
 
         if norm_mode == NormalizationMode.MIN_MAX:
             min_val = stats.get("min", None)
@@ -367,14 +369,17 @@ class _NormalizationMixin:
                     "QUANTILES normalization mode requires q01 and q99 stats, please update the dataset with the correct stats using the `augment_dataset_quantile_stats.py` script"
                 )
 
-            denom = q99 - q01
-            # Avoid division by zero by adding epsilon when quantiles are identical
-            denom = torch.where(
-                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
-            )
+            raw_denom = q99 - q01
+            # Identical (or numerically equal) quantiles: treat as constant → 0.
+            # Replacing denom with eps alone still explodes when values ≠ q01
+            # (e.g. Rot6D EE rest dims with q01==q99 but min/max spanning outliers).
+            constant = raw_denom.abs() <= self.eps
+            denom = torch.where(constant, torch.ones_like(raw_denom), raw_denom)
             if inverse:
-                return (tensor + 1.0) * denom / 2.0 + q01
-            return 2.0 * (tensor - q01) / denom - 1.0
+                return torch.where(constant, q01.expand_as(tensor), (tensor + 1.0) * raw_denom / 2.0 + q01)
+            return torch.where(
+                constant, torch.zeros_like(tensor), 2.0 * (tensor - q01) / denom - 1.0
+            )
 
         if norm_mode == NormalizationMode.QUANTILE10:
             q10 = stats.get("q10", None)
@@ -384,14 +389,14 @@ class _NormalizationMixin:
                     "QUANTILE10 normalization mode requires q10 and q90 stats, please update the dataset with the correct stats using the `augment_dataset_quantile_stats.py` script"
                 )
 
-            denom = q90 - q10
-            # Avoid division by zero by adding epsilon when quantiles are identical
-            denom = torch.where(
-                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
-            )
+            raw_denom = q90 - q10
+            constant = raw_denom.abs() <= self.eps
+            denom = torch.where(constant, torch.ones_like(raw_denom), raw_denom)
             if inverse:
-                return (tensor + 1.0) * denom / 2.0 + q10
-            return 2.0 * (tensor - q10) / denom - 1.0
+                return torch.where(constant, q10.expand_as(tensor), (tensor + 1.0) * raw_denom / 2.0 + q10)
+            return torch.where(
+                constant, torch.zeros_like(tensor), 2.0 * (tensor - q10) / denom - 1.0
+            )
 
         # If necessary stats are missing, return input unchanged.
         return tensor

@@ -132,6 +132,14 @@ def load_nested_dataset(
         table = arrow_dataset.to_table(filter=filter_expr)
 
         if features is not None:
+            # Parquet physical column order can differ from info.json feature order;
+            # pyarrow Table.cast requires matching field-name order.
+            schema_names = list(features.arrow_schema.names)
+            missing = [name for name in schema_names if name not in table.column_names]
+            if missing:
+                raise ValueError(f"Filtered parquet table missing columns required by features: {missing}")
+            extras = [name for name in table.column_names if name not in schema_names]
+            table = table.select(schema_names + extras)
             table = table.cast(features.arrow_schema)
 
         return Dataset(table)

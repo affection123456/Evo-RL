@@ -596,8 +596,18 @@ def aggregate_feature_stats(stats_ft_list: list[dict[str, dict]]) -> dict[str, d
         for q_key in quantile_keys:
             if all(q_key in s for s in stats_ft_list):
                 quantile_values = np.stack([s[q_key] for s in stats_ft_list])
-                weighted_quantiles = quantile_values * counts
-                aggregated[q_key] = weighted_quantiles.sum(axis=0) / total_count
+                # Averaging per-episode quantiles is invalid: if each episode is nearly
+                # constant at a different value, weighted-mean(q01)≈weighted-mean(q99)
+                # and the span collapses to ~0, which explodes QUANTILES normalization.
+                # Use an envelope: lower quantiles → min across episodes, upper → max,
+                # median → count-weighted mean.
+                q_pct = int(q_key[1:])
+                if q_pct < 50:
+                    aggregated[q_key] = np.min(quantile_values, axis=0)
+                elif q_pct > 50:
+                    aggregated[q_key] = np.max(quantile_values, axis=0)
+                else:
+                    aggregated[q_key] = (quantile_values * counts).sum(axis=0) / total_count
 
     return aggregated
 
