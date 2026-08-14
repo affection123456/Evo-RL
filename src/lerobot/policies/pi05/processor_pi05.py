@@ -22,13 +22,16 @@ import numpy as np
 import torch
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+from lerobot.policies.ee_action_contract import (
+    EEActionContract,
+    make_ee_action_contract,
+    make_raw_ee_action_template,
+    pack_ee_tensor,
+    pad_or_clip_ee,
+    unpack_ee_tensor,
+)
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import pad_vector
-from lerobot.policies.pi0_dmp.processor_pi0_dmp import (
-    _pad_or_clip,
-    _quat_pose_to_rot6d,
-    _rot6d_pose_to_quat,
-)
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -62,7 +65,6 @@ OBS_HAND_RIGHT = f"{OBS_IMAGES}.hand_right"
 OBS_HAND_LEFT = f"{OBS_IMAGES}.hand_left"
 OBS_EE_STATE = "observation.ee_state"
 OBS_EE_ACTIONS = "observation.ee_actions"
-PI05_ROT6D_POSE_DIM = 18
 
 
 def _first_present(mapping: dict[str, Any], *keys: str) -> Any | None:
@@ -107,7 +109,12 @@ def pi05_batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
 @ProcessorStepRegistry.register(name="pi05_rot6d_delta_processor")
 @dataclass
 class Pi05Rot6DDeltaProcessorStep(ProcessorStep):
-    """Map dual-arm EE quaternion pose to full32 Rot6D state/actions."""
+    """Map raw EE pose → selected canonical state/action contract.
+
+    Selection and raw indices come from ``ee_action_contract``. ``use_rot6d``
+    chooses xyz+quat+gripper (8D right1) or xyz+rot6d+gripper (10D right1).
+    The selected physical vector is then padded to the model head width.
+    """
 
     state_dim: int = 32
     action_dim: int = 32
@@ -115,6 +122,9 @@ class Pi05Rot6DDeltaProcessorStep(ProcessorStep):
     ee_action_key: str = "observation.ee_actions"
     use_delta: bool = False
     delta_dims: int | None = None
+    use_rot6d: bool = True
+    arm_mode: str = "right"
+    gripper_dims: int = 1
 
     def get_config(self) -> dict[str, Any]:
         return {
@@ -124,7 +134,22 @@ class Pi05Rot6DDeltaProcessorStep(ProcessorStep):
             "ee_action_key": self.ee_action_key,
             "use_delta": self.use_delta,
             "delta_dims": self.delta_dims,
+            "use_rot6d": self.use_rot6d,
+            "arm_mode": self.arm_mode,
+            "gripper_dims": self.gripper_dims,
         }
+
+    def _contract(self) -> EEActionContract:
+        return make_ee_action_contract(
+            use_rot6d=self.use_rot6d,
+            arm_mode=self.arm_mode,
+            gripper_dims=self.gripper_dims,
+        )
+
+    def _pose_delta_dims(self) -> int:
+        if self.delta_dims is not None:
+            return self.delta_dims
+        return self._contract().pose_dim
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
@@ -136,7 +161,8 @@ class Pi05Rot6DDeltaProcessorStep(ProcessorStep):
                 f"pi05 Rot6D requires EE quat state; missing any of "
                 f"{self.ee_state_key!r}, 'ee_state', {OBS_STATE!r}"
             )
-        state = _pad_or_clip(_quat_pose_to_rot6d(torch.as_tensor(raw_state)), self.state_dim)
+        contract = self._contract()
+        state = pad_or_clip_ee(pack_ee_tensor(torch.as_tensor(raw_state), contract), self.state_dim)
 
         # Prefer EE quat actions; dataset `action` is often joint-space and must not be used.
         raw_action = _first_present(observation, self.ee_action_key, "ee_actions")
@@ -145,11 +171,14 @@ class Pi05Rot6DDeltaProcessorStep(ProcessorStep):
         actions = (
             None
             if raw_action is None
-            else _pad_or_clip(_quat_pose_to_rot6d(torch.as_tensor(raw_action)), self.action_dim)
+            else pad_or_clip_ee(
+                pack_ee_tensor(torch.as_tensor(raw_action), contract),
+                self.action_dim,
+            )
         )
 
         if self.use_delta and actions is not None:
-            delta_dims = PI05_ROT6D_POSE_DIM if self.delta_dims is None else self.delta_dims
+            delta_dims = self._pose_delta_dims()
             dims = min(delta_dims, self.action_dim, self.state_dim)
             if dims > 0:
                 actions = actions.clone()
@@ -175,10 +204,12 @@ def decode_pi05_policy_actions(
     raw_observation: dict[str, Any],
     policy_cfg: PI05Config | Any,
 ) -> torch.Tensor:
-    """Convert full32 Rot6D model outputs to absolute dual-arm quaternion EE actions."""
-    if not getattr(policy_cfg, "use_rot6d", False):
-        return actions
-
+    """Decode selected model output and scatter it into a full raw EE action."""
+    contract = make_ee_action_contract(
+        use_rot6d=bool(getattr(policy_cfg, "use_rot6d", False)),
+        arm_mode=getattr(policy_cfg, "ee_arm_mode", "right"),
+        gripper_dims=int(getattr(policy_cfg, "ee_gripper_dims", 1)),
+    )
     decoded = actions
     state_value = _first_present(
         raw_observation,
@@ -191,9 +222,12 @@ def decode_pi05_policy_actions(
     if getattr(policy_cfg, "rot6d_delta_action", False) and state_value is not None:
         max_state_dim = getattr(policy_cfg, "max_state_dim", actions.shape[-1])
         max_action_dim = getattr(policy_cfg, "max_action_dim", actions.shape[-1])
-        delta_dims = min(PI05_ROT6D_POSE_DIM, max_action_dim, max_state_dim)
+        delta_dims = min(contract.pose_dim, max_action_dim, max_state_dim)
 
-        state = _pad_or_clip(_quat_pose_to_rot6d(torch.as_tensor(state_value)), max_state_dim)
+        state = pad_or_clip_ee(
+            pack_ee_tensor(torch.as_tensor(state_value), contract),
+            max_state_dim,
+        )
         if state.ndim == 1:
             state = state.unsqueeze(0)
         state = state.to(device=actions.device, dtype=actions.dtype)
@@ -212,10 +246,16 @@ def decode_pi05_policy_actions(
         "ee_actions",
         ACTION,
     )
-    decoded = _rot6d_pose_to_quat(decoded)
+    if state_value is None:
+        raise KeyError("EE contract decode needs raw EE state as a full-action template.")
     if ee_action is not None:
-        decoded = _pad_or_clip(decoded, int(torch.as_tensor(ee_action).shape[-1]))
-    return decoded
+        action_dim = int(torch.as_tensor(ee_action).shape[-1])
+    else:
+        action_dim = int(
+            getattr(policy_cfg, "ee_raw_action_dim", torch.as_tensor(state_value).shape[-1])
+        )
+    template = make_raw_ee_action_template(torch.as_tensor(state_value), action_dim)
+    return unpack_ee_tensor(decoded, template, contract)
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -302,22 +342,23 @@ def make_pi05_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
-    rot6d_steps: list[ProcessorStep] = []
-    if getattr(config, "use_rot6d", False):
-        rot6d_steps = [
-            Pi05Rot6DDeltaProcessorStep(
-                state_dim=config.max_state_dim,
-                action_dim=config.max_action_dim,
-                ee_state_key=config.ee_state_key,
-                ee_action_key=config.ee_action_key,
-                use_delta=bool(getattr(config, "rot6d_delta_action", False)),
-            )
-        ]
+    contract_steps: list[ProcessorStep] = [
+        Pi05Rot6DDeltaProcessorStep(
+            state_dim=config.max_state_dim,
+            action_dim=config.max_action_dim,
+            ee_state_key=config.ee_state_key,
+            ee_action_key=config.ee_action_key,
+            use_delta=bool(getattr(config, "rot6d_delta_action", False)),
+            use_rot6d=bool(getattr(config, "use_rot6d", False)),
+            arm_mode=getattr(config, "ee_arm_mode", "right"),
+            gripper_dims=int(getattr(config, "ee_gripper_dims", 1)),
+        )
+    ]
 
     # Add remaining processors
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
-        *rot6d_steps,
+        *contract_steps,
         AddBatchDimensionProcessorStep(),
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization

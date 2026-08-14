@@ -66,6 +66,9 @@ POLICY_REPO_ID="unt_hub/policy_model"
 POLICY_EXTRA_ARGS=()
 if [[ "${POLICY_TYPE}" == "pi0_dmp" ]]; then
   POLICY_EXTRA_ARGS=(
+    --policy.use_rot6d="${EE_USE_ROT6D}"
+    --policy.ee_arm_mode="${EE_ARM_MODE}"
+    --policy.ee_gripper_dims="${EE_GRIPPER_DIMS}"
     --policy.rot6d_delta_action=false
     --policy.max_state_dim=32
     --policy.max_action_dim=32
@@ -75,8 +78,12 @@ if [[ "${POLICY_TYPE}" == "pi0_dmp" ]]; then
     --rename_map='{"ee_state":"observation.state","ee_actions":"action","top_head":"observation.images.top_head","hand_right":"observation.images.hand_right","ref_ee_state":"observation.reference.state","ref_ee_actions":"observation.ref_actions","ref_top_head":"observation.images.ref_top_head","ref_hand_right":"observation.images.ref_hand_right"}'
   )
 elif [[ "${POLICY_TYPE}" == "pi05" ]]; then
-  # Historical dual-arm xyz+Rot6D pose plus raw tail, clipped/padded to full32.
+  # Shared EE contract: right xyz+rotation+gripper_first(1) by default.
+  # use_rot6d=true => 10 physical dims; false => 8; model head stays pad32.
   POLICY_EXTRA_ARGS=(
+    --policy.use_rot6d="${EE_USE_ROT6D}"
+    --policy.ee_arm_mode="${EE_ARM_MODE}"
+    --policy.ee_gripper_dims="${EE_GRIPPER_DIMS}"
     --policy.rot6d_delta_action=false
     --policy.max_state_dim=32
     --policy.max_action_dim=32

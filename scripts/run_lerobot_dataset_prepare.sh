@@ -16,6 +16,7 @@
 # Optional:
 #   --hf-lerobot-home   默认 /mnt/nas/datasets/rldata/lerobot
 #   --normalize-ee-gripper=false  关闭夹爪 [0,1000]->[0,1]（默认开启）
+#   --ee-use-rot6d=true|false / --ee-arm-mode=right|left|both / --ee-gripper-dims=1
 #   --run-dataset-report=0
 #
 # 路径一律：${HF_LEROBOT_HOME}/${DATASET_REPO_ID}
@@ -31,6 +32,9 @@ STEP="${EVO_RL_POSITIONAL[0]:-all}"
 RUN_DATASET_REPORT="${RUN_DATASET_REPORT:-1}"
 PI05_ROT6D_STATS="${PI05_ROT6D_STATS:-1}"
 PI05_ROT6D_DELTA="${PI05_ROT6D_DELTA:-0}"
+EE_USE_ROT6D="${EE_USE_ROT6D:-true}"
+EE_ARM_MODE="${EE_ARM_MODE:-right}"
+EE_GRIPPER_DIMS="${EE_GRIPPER_DIMS:-1}"
 PI05_ROT6D_STATE_DIM="${PI05_ROT6D_STATE_DIM:-32}"
 PI05_ROT6D_ACTION_DIM="${PI05_ROT6D_ACTION_DIM:-32}"
 NORMALIZE_EE_GRIPPER="${NORMALIZE_EE_GRIPPER:-1}"
@@ -259,11 +263,14 @@ _augment() {
     if [[ "${PI05_ROT6D_DELTA}" == "1" ]]; then
       _delta_tag="pose-delta"
     fi
-    echo "  + pi05 dual-arm full32 Rot6D (${_delta_tag}, pad=${PI05_ROT6D_ACTION_DIM})"
+    echo "  + pi05 EE contract (${_delta_tag}, use_rot6d=${EE_USE_ROT6D}, arm=${EE_ARM_MODE}, grip_dims=${EE_GRIPPER_DIMS}, pad=${PI05_ROT6D_ACTION_DIM})"
     rot6d_args=(
       --pi05-rot6d-stats
       --rot6d-state-dim="${PI05_ROT6D_STATE_DIM}"
       --rot6d-action-dim="${PI05_ROT6D_ACTION_DIM}"
+      --ee-use-rot6d="${EE_USE_ROT6D}"
+      --ee-arm-mode="${EE_ARM_MODE}"
+      --ee-gripper-dims="${EE_GRIPPER_DIMS}"
     )
     if [[ "${PI05_ROT6D_DELTA}" == "1" ]]; then
       rot6d_args+=(--pi05-rot6d-delta)

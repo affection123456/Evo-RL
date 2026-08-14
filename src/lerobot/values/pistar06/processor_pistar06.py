@@ -12,6 +12,11 @@ import torch.nn.functional as functional
 from torch import Tensor
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.policies.ee_action_contract import (
+    make_ee_action_contract,
+    pack_ee_tensor,
+    pad_or_clip_ee,
+)
 from lerobot.processor import (
     DeviceProcessorStep,
     NormalizerProcessorStep,
@@ -119,6 +124,8 @@ class Pistar06Rot6DStateProcessorStep(ProcessorStep):
     ref_state_feature: str = "observation.reference.state"
     max_state_dim: int = 32
     use_rot6d: bool = True
+    arm_mode: str = "right"
+    gripper_dims: int = 1
 
     def get_config(self) -> dict[str, Any]:
         return {
@@ -126,17 +133,24 @@ class Pistar06Rot6DStateProcessorStep(ProcessorStep):
             "ref_state_feature": self.ref_state_feature,
             "max_state_dim": self.max_state_dim,
             "use_rot6d": self.use_rot6d,
+            "arm_mode": self.arm_mode,
+            "gripper_dims": self.gripper_dims,
         }
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
         observation = dict(transition.get(TransitionKey.OBSERVATION) or {})
+        contract = make_ee_action_contract(
+            use_rot6d=self.use_rot6d,
+            arm_mode=self.arm_mode,
+            gripper_dims=self.gripper_dims,
+        )
         for key in (self.state_feature, self.ref_state_feature):
             if key in observation:
-                value = torch.as_tensor(observation[key])
-                if self.use_rot6d:
-                    value = _quat_pose_to_rot6d(value)
-                observation[key] = _pad_or_clip_last_dim(value, self.max_state_dim)
+                observation[key] = pad_or_clip_ee(
+                    pack_ee_tensor(torch.as_tensor(observation[key]), contract),
+                    self.max_state_dim,
+                )
         transition[TransitionKey.OBSERVATION] = observation
         return transition
 
@@ -415,6 +429,8 @@ def make_pistar06_pre_post_processors(
             ref_state_feature=config.ref_state_feature,
             max_state_dim=config.max_state_dim,
             use_rot6d=bool(getattr(config, "use_rot6d", True)),
+            arm_mode=getattr(config, "ee_arm_mode", "right"),
+            gripper_dims=int(getattr(config, "ee_gripper_dims", 1)),
         ),
         NormalizerProcessorStep(
             features=processor_features,

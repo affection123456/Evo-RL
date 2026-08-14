@@ -6,6 +6,14 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+from lerobot.policies.ee_action_contract import (
+    EEActionContract,
+    make_ee_action_contract,
+    make_raw_ee_action_template,
+    pack_ee_tensor,
+    pad_or_clip_ee,
+    unpack_ee_tensor,
+)
 from lerobot.policies.pi0.processor_pi0 import Pi0NewLineProcessor
 from lerobot.policies.pi0_dmp.configuration_pi0_dmp import PI0DMPConfig
 from lerobot.processor import (
@@ -188,7 +196,7 @@ def decode_pi0_dmp_policy_actions(
     raw_observation: dict[str, Any],
     policy_cfg: PI0DMPConfig | Any,
 ) -> torch.Tensor:
-    """Decode full32 Rot6D output to a dual-arm quaternion EE action."""
+    """Decode selected model output and scatter it into a full raw EE action."""
     state_value = None
     for key in (OBS_STATE, "observation/state", "ee_state"):
         if key in raw_observation:
@@ -200,15 +208,22 @@ def decode_pi0_dmp_policy_actions(
     max_state_dim = getattr(policy_cfg, "max_state_dim", actions.shape[-1])
     max_action_dim = getattr(policy_cfg, "max_action_dim", actions.shape[-1])
     use_delta = bool(getattr(policy_cfg, "rot6d_delta_action", False))
+    contract = make_ee_action_contract(
+        use_rot6d=bool(getattr(policy_cfg, "use_rot6d", True)),
+        arm_mode=getattr(policy_cfg, "ee_arm_mode", "right"),
+        gripper_dims=int(getattr(policy_cfg, "ee_gripper_dims", 1)),
+    )
 
-    state = _pad_or_clip(_quat_pose_to_rot6d(torch.as_tensor(state_value)), max_state_dim)
+    state = pad_or_clip_ee(
+        pack_ee_tensor(torch.as_tensor(state_value), contract), max_state_dim
+    )
     if state.ndim == 1:
         state = state.unsqueeze(0)
     state = state.to(device=actions.device, dtype=actions.dtype)
 
     decoded = actions.clone()
     if use_delta:
-        delta_dims = min(PI0_DMP_ROT6D_POSE_DIM, max_action_dim, max_state_dim)
+        delta_dims = min(contract.pose_dim, max_action_dim, max_state_dim)
         if delta_dims > 0:
             state_for_delta = state
             if decoded.ndim == state.ndim + 1:
@@ -216,10 +231,10 @@ def decode_pi0_dmp_policy_actions(
             decoded[..., :delta_dims] = decoded[..., :delta_dims] + state_for_delta[..., :delta_dims]
 
     target_dim = _resolve_quat_action_dim(raw_observation, policy_cfg)
-    decoded = _rot6d_pose_to_quat(decoded)
-    if target_dim is not None:
-        decoded = _pad_or_clip(decoded, target_dim)
-    return decoded
+    if target_dim is None:
+        target_dim = int(torch.as_tensor(state_value).shape[-1])
+    template = make_raw_ee_action_template(torch.as_tensor(state_value), target_dim)
+    return unpack_ee_tensor(decoded, template, contract)
 
 
 def _pad_or_clip(x: torch.Tensor, dim: int) -> torch.Tensor:
@@ -241,6 +256,9 @@ class PI0DMPRot6DDeltaProcessorStep(ProcessorStep):
         ref_action_key: str = OBS_REF_ACTIONS,
         use_delta: bool = False,
         delta_dims: int | None = None,
+        use_rot6d: bool = True,
+        arm_mode: str = "right",
+        gripper_dims: int = 1,
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -248,30 +266,41 @@ class PI0DMPRot6DDeltaProcessorStep(ProcessorStep):
         self.ref_state_key = ref_state_key
         self.ref_action_key = ref_action_key
         self.use_delta = use_delta
+        self.use_rot6d = use_rot6d
+        self.arm_mode = arm_mode
+        self.gripper_dims = gripper_dims
         self.delta_dims = delta_dims
+
+    def _contract(self) -> EEActionContract:
+        return make_ee_action_contract(
+            use_rot6d=self.use_rot6d,
+            arm_mode=self.arm_mode,
+            gripper_dims=self.gripper_dims,
+        )
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
         observation = dict(transition.get(TransitionKey.OBSERVATION) or {})
 
-        state = _pad_or_clip(
-            _quat_pose_to_rot6d(torch.as_tensor(observation[self.state_key])), self.state_dim
+        contract = self._contract()
+        state = pad_or_clip_ee(
+            pack_ee_tensor(torch.as_tensor(observation[self.state_key]), contract), self.state_dim
         )
-        ref_state = _pad_or_clip(
-            _quat_pose_to_rot6d(torch.as_tensor(observation[self.ref_state_key])), self.state_dim
+        ref_state = pad_or_clip_ee(
+            pack_ee_tensor(torch.as_tensor(observation[self.ref_state_key]), contract), self.state_dim
         )
         raw_action = transition.get(TransitionKey.ACTION)
         actions = (
             None
             if raw_action is None
-            else _pad_or_clip(_quat_pose_to_rot6d(torch.as_tensor(raw_action)), self.action_dim)
+            else pad_or_clip_ee(pack_ee_tensor(torch.as_tensor(raw_action), contract), self.action_dim)
         )
-        ref_actions = _pad_or_clip(
-            _quat_pose_to_rot6d(torch.as_tensor(observation[self.ref_action_key])), self.action_dim
+        ref_actions = pad_or_clip_ee(
+            pack_ee_tensor(torch.as_tensor(observation[self.ref_action_key]), contract), self.action_dim
         )
 
         if self.use_delta:
-            delta_dims = PI0_DMP_ROT6D_POSE_DIM if self.delta_dims is None else self.delta_dims
+            delta_dims = contract.pose_dim if self.delta_dims is None else self.delta_dims
             dims = min(delta_dims, self.action_dim, self.state_dim)
             if dims > 0:
                 ref_actions = ref_actions.clone()
@@ -302,6 +331,9 @@ class PI0DMPRot6DDeltaProcessorStep(ProcessorStep):
             "ref_action_key": self.ref_action_key,
             "use_delta": self.use_delta,
             "delta_dims": self.delta_dims,
+            "use_rot6d": self.use_rot6d,
+            "arm_mode": self.arm_mode,
+            "gripper_dims": self.gripper_dims,
         }
 
 
@@ -320,6 +352,9 @@ def make_pi0_dmp_pre_post_processors(
             ref_state_key=config.ref_state_key,
             ref_action_key=config.ref_action_key,
             use_delta=bool(getattr(config, "rot6d_delta_action", False)),
+            use_rot6d=bool(getattr(config, "use_rot6d", True)),
+            arm_mode=getattr(config, "ee_arm_mode", "right"),
+            gripper_dims=int(getattr(config, "ee_gripper_dims", 1)),
         ),
         AddBatchDimensionProcessorStep(),
         Pi0NewLineProcessor(),

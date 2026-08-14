@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
+from lerobot.policies.ee_action_contract import make_ee_action_contract
 
 
 @PreTrainedConfig.register_subclass("pi0_dmp")
@@ -21,9 +22,12 @@ class PI0DMPConfig(PI0Config):
     chunk_size: int = 50
     n_action_steps: int = 50
 
-    # Historical full32 dual-arm Rot6D representation.
+    # Shared model-facing EE contract.
     use_rot6d: bool = True
+    ee_arm_mode: str = "right"  # left | right | both
+    ee_gripper_dims: int = 1
     ee_raw_action_dim: int = 34
+    loss_action_dim: int | None = None
 
     # Absolute Rot6D by default; set True for pose-only delta vs state
     # (requires matching delta action / ref_actions stats).
@@ -51,13 +55,23 @@ class PI0DMPConfig(PI0Config):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if not self.use_rot6d:
-            raise ValueError("PI0-DMP full32 processor requires use_rot6d=True")
-        if self.max_state_dim < 18:
+        contract = make_ee_action_contract(
+            use_rot6d=self.use_rot6d,
+            arm_mode=self.ee_arm_mode,
+            gripper_dims=self.ee_gripper_dims,
+        )
+        if self.loss_action_dim is None:
+            object.__setattr__(self, "loss_action_dim", contract.physical_dim)
+        if self.max_state_dim < contract.physical_dim:
             raise ValueError(
-                f"use_rot6d requires max_state_dim >= 18 for dual-arm xyz+rot6d, got {self.max_state_dim}"
+                f"max_state_dim={self.max_state_dim} is smaller than {contract.description}"
             )
-        if self.max_action_dim < 18:
+        if self.max_action_dim < contract.physical_dim:
             raise ValueError(
-                f"use_rot6d requires max_action_dim >= 18 for dual-arm xyz+rot6d, got {self.max_action_dim}"
+                f"max_action_dim={self.max_action_dim} is smaller than {contract.description}"
+            )
+        if not 0 < int(self.loss_action_dim) <= contract.physical_dim:
+            raise ValueError(
+                f"loss_action_dim must be in [1, physical_dim={contract.physical_dim}], "
+                f"got {self.loss_action_dim}"
             )

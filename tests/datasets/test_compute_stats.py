@@ -29,28 +29,11 @@ from lerobot.datasets.compute_stats import (
     sample_images,
     sample_indices,
 )
-from lerobot.datasets.v30 import augment_dataset_quantile_stats as quantile_stats
 from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
 
 
 def mock_load_image_as_numpy(path, dtype, channel_first):
     return np.ones((3, 32, 32), dtype=dtype) if channel_first else np.ones((32, 32, 3), dtype=dtype)
-
-
-def test_quantile_stats_use_full32_dual_arm_rot6d_layout() -> None:
-    pose = np.zeros((2, 34), dtype=np.float32)
-    pose[..., 6] = 1.0
-    pose[..., 13] = 1.0
-    pose[..., 14:] = np.arange(20, dtype=np.float32)
-    converter = getattr(
-        quantile_stats,
-        "_quat_pose_to_rot6d",
-        lambda value: quantile_stats._ee_to_contract(
-            value, use_rot6d=True, arm_mode="both", gripper_dims=6
-        ),
-    )
-    actual = quantile_stats._pad_or_clip_last_dim(converter(pose), 32)
-    np.testing.assert_allclose(actual[..., 18:], pose[..., 14:28])
 
 
 @pytest.fixture

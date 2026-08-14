@@ -12,6 +12,7 @@ from safetensors.torch import load_file
 from torch import Tensor
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.ee_action_contract import mask_padded_ee
 from lerobot.policies.pi0.modeling_pi0 import (
     PI0Policy,
     PI0Pytorch,
@@ -29,6 +30,13 @@ if TYPE_CHECKING:
 
 class PI0DMPPytorch(PI0Pytorch):
     """PI0 core model variant that can condition on reference state/actions."""
+
+    def _mask_padded_action_dims(self, x: Tensor) -> Tensor:
+        physical_dim = int(self.config.loss_action_dim or x.shape[-1])
+        return mask_padded_ee(x, physical_dim)
+
+    def sample_noise(self, shape, device):
+        return self._mask_padded_action_dims(super().sample_noise(shape, device))
 
     def embed_suffix(self, state, noisy_actions, timestep, ref_state=None):
         embs = []
@@ -104,8 +112,10 @@ class PI0DMPPytorch(PI0Pytorch):
         ref_actions=None,
     ) -> Tensor:
         """Training forward pass with optional reference trajectory as flow noise."""
+        actions = self._mask_padded_action_dims(actions)
         if noise is None:
             noise = ref_actions if ref_actions is not None else self.sample_noise(actions.shape, actions.device)
+        noise = self._mask_padded_action_dims(noise)
 
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
@@ -175,7 +185,7 @@ class PI0DMPPytorch(PI0Pytorch):
             noise = self.sample_noise((bsize, self.config.chunk_size, self.config.max_action_dim), device)
 
         dt = -1.0 / num_steps
-        x_t = noise
+        x_t = self._mask_padded_action_dims(noise)
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
@@ -209,7 +219,7 @@ class PI0DMPPytorch(PI0Pytorch):
             )
             suffix_out = outputs_embeds[1][:, -self.config.chunk_size :].to(dtype=torch.float32)
             v_t = self.action_out_proj(suffix_out)
-            x_t = x_t + dt * v_t
+            x_t = self._mask_padded_action_dims(x_t + dt * v_t)
         return x_t
 
 
@@ -417,6 +427,8 @@ class PI0DMPPolicy(PI0Policy):
             ref_actions=ref_actions,
         )
 
+        loss_action_dim = int(getattr(self.config, "loss_action_dim", actions.shape[-1]))
+        losses = losses[:, :, :loss_action_dim]
         per_sample_loss = losses.mean(dim=(1, 2))
 
         loss_dict = {

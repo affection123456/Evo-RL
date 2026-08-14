@@ -15,6 +15,7 @@
 #
 # Optional:
 #   --hf-lerobot-home   默认 /mnt/nas/datasets/rldata/lerobot
+#   --ee-use-rot6d=true|false / --ee-arm-mode=right|left|both / --ee-gripper-dims=1
 #   --normalize-ee-gripper=false  关闭夹爪 [0,1000]->[0,1]（默认开启）
 #   --run-dataset-report=0
 #
@@ -30,6 +31,9 @@ evo_rl_parse_script_args "$@"
 STEP="${EVO_RL_POSITIONAL[0]:-all}"
 RUN_DATASET_REPORT="${RUN_DATASET_REPORT:-1}"
 NORMALIZE_EE_GRIPPER="${NORMALIZE_EE_GRIPPER:-1}"
+EE_USE_ROT6D="${EE_USE_ROT6D:-true}"
+EE_ARM_MODE="${EE_ARM_MODE:-right}"
+EE_GRIPPER_DIMS="${EE_GRIPPER_DIMS:-1}"
 export USR_NAME="${USR_NAME:-wanghao}"
 export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-/mnt/nas/datasets/rldata/lerobot}"
 unset LEROBOT_HOME
@@ -194,12 +198,15 @@ _augment() {
     _delta_tag="pose-delta"
     _delta_args=(--pi0-dmp-rot6d-delta)
   fi
-  echo "Augment quantile stats (pi0_dmp dual-arm full32 Rot6D/${_delta_tag}, pad=${ROT6D_STATE_DIM}): repo_id=${DATASET_REPO_ID} root=${LOCAL_ROOT}"
+  echo "Augment quantile stats (pi0_dmp EE/${_delta_tag}, use_rot6d=${EE_USE_ROT6D}, arm=${EE_ARM_MODE}, grip_dims=${EE_GRIPPER_DIMS}, pad=${ROT6D_STATE_DIM}): repo_id=${DATASET_REPO_ID} root=${LOCAL_ROOT}"
   "${PYTHON}" "${REPO_ROOT}/src/lerobot/datasets/v30/augment_dataset_quantile_stats.py" \
     --repo-id="${DATASET_REPO_ID}" \
     --root="${LOCAL_ROOT}" \
     --overwrite \
     --pi0-dmp-rot6d-stats \
+    --ee-use-rot6d="${EE_USE_ROT6D}" \
+    --ee-arm-mode="${EE_ARM_MODE}" \
+    --ee-gripper-dims="${EE_GRIPPER_DIMS}" \
     --rot6d-state-dim="${ROT6D_STATE_DIM}" \
     --rot6d-action-dim="${ROT6D_ACTION_DIM}" \
     "${_delta_args[@]}"

@@ -15,6 +15,7 @@ from typing_extensions import override
 
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.ee_action_contract import make_ee_action_contract
 from lerobot.scripts.lerobot_policy_infer import (
     PolicyInferWebsocketConfig,
     WebsocketServerConfig,
@@ -133,7 +134,7 @@ def _pi0_dmp_sample_actions_cached(
     )
 
     dt = -1.0 / num_steps
-    x_t = noise
+    x_t = model._mask_padded_action_dims(noise)
     for step in range(num_steps):
         time = 1.0 + step * dt
         timestep = torch.tensor(time, dtype=torch.float32, device=device).expand(batch_size)
@@ -146,7 +147,7 @@ def _pi0_dmp_sample_actions_cached(
             x_t=x_t,
             timestep=timestep,
         )
-        x_t = x_t + dt * velocity
+        x_t = model._mask_padded_action_dims(x_t + dt * velocity)
     return x_t
 
 
@@ -323,11 +324,18 @@ class LeRobotOpenPIBridge(_base_policy.BasePolicy):
 
         state_key = _response_state_key(self._policy_cfg)
         state = observation[state_key]
-        required_state_dim = 14
+        contract = None
+        if getattr(self._policy_cfg, "type", None) in {"pi05", "pi0_dmp"}:
+            contract = make_ee_action_contract(
+                use_rot6d=bool(getattr(self._policy_cfg, "use_rot6d", True)),
+                arm_mode=getattr(self._policy_cfg, "ee_arm_mode", "right"),
+                gripper_dims=int(getattr(self._policy_cfg, "ee_gripper_dims", 1)),
+            )
+        required_state_dim = contract.raw_required_dim if contract is not None else 14
         if state.ndim != 1 or state.shape[-1] < required_state_dim:
             raise ValueError(
                 f"Expected {state_key} shape [D>={required_state_dim}] for "
-                f"dual-arm xyz+quaternion EE pose, got {state.shape}"
+                f"{contract.description if contract is not None else 'EE pose'}, got {state.shape}"
             )
 
         if getattr(self._policy_cfg, "type", None) == "pi0_dmp":
@@ -354,10 +362,11 @@ class LeRobotOpenPIBridge(_base_policy.BasePolicy):
                 getattr(self._policy_cfg, "type", None),
                 schema,
             )
-            logging.info(
-                "Model-facing EE layout: dual-arm xyz+Rot6D pose plus raw tail, clip/pad32 "
-                "(raw quaternion EE state retained for decoding)"
-            )
+            if contract is not None:
+                logging.info(
+                    "Model-facing EE contract: %s (raw EE state retained only as decode template)",
+                    contract.description,
+                )
             self._logged_observation_schema = True
 
     @override

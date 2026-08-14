@@ -55,6 +55,9 @@ if [[ "${POLICY_TYPE}" == "pi0_dmp" ]]; then
   VALUE_EXTRA_ARGS=(
     --value.enable_stage_heads=true
     --value.include_ref_state_in_prompt=true
+    --value.use_rot6d="${EE_USE_ROT6D}"
+    --value.ee_arm_mode="${EE_ARM_MODE}"
+    --value.ee_gripper_dims="${EE_GRIPPER_DIMS}"
     --value.max_state_dim=32
     --value.state_feature="observation.state"
     --value.ref_state_feature="observation.reference.state"
@@ -66,6 +69,9 @@ if [[ "${POLICY_TYPE}" == "pi0_dmp" ]]; then
 elif [[ "${POLICY_TYPE}" == "pi05" ]]; then
   # EE quat → observation.state → Rot6D pad32；rename 兼容 DMP bare keys 与 basket observation.ee_*
   VALUE_EXTRA_ARGS=(
+    --value.use_rot6d="${EE_USE_ROT6D}"
+    --value.ee_arm_mode="${EE_ARM_MODE}"
+    --value.ee_gripper_dims="${EE_GRIPPER_DIMS}"
     --value.max_state_dim=32
     --value.state_feature="observation.state"
     --rename_map='{"ee_state":"observation.state","observation.ee_state":"observation.state","top_head":"observation.images.top_head","hand_right":"observation.images.hand_right","hand_left":"observation.images.hand_left"}'

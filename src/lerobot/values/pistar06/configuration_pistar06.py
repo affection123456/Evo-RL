@@ -6,6 +6,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.policies.ee_action_contract import make_ee_action_contract
 from lerobot.utils.constants import OBS_STATE
 
 
@@ -28,8 +29,10 @@ class Pistar06Config(PreTrainedConfig):
     ref_state_feature: str = "observation.reference.state"
     include_state_in_prompt: bool = True
     include_ref_state_in_prompt: bool = False
-    # Historical full32 dual-arm Rot6D state representation.
+    # Same EE selection contract as PI05 / PI0-DMP.
     use_rot6d: bool = True
+    ee_arm_mode: str = "right"
+    ee_gripper_dims: int = 1
     # Deprecated checkpoint alias. None means use ``use_rot6d``.
     use_rot6d_state: bool | None = None
     max_state_dim: int = 32
@@ -89,9 +92,14 @@ class Pistar06Config(PreTrainedConfig):
 
         if self.use_rot6d_state is not None:
             object.__setattr__(self, "use_rot6d", bool(self.use_rot6d_state))
-        if self.use_rot6d and self.max_state_dim < 18:
+        contract = make_ee_action_contract(
+            use_rot6d=self.use_rot6d,
+            arm_mode=self.ee_arm_mode,
+            gripper_dims=self.ee_gripper_dims,
+        )
+        if self.max_state_dim < contract.physical_dim:
             raise ValueError(
-                f"'value.max_state_dim'={self.max_state_dim} must be at least 18 for dual-arm xyz+rot6d"
+                f"'value.max_state_dim'={self.max_state_dim} is smaller than {contract.description}"
             )
 
         if not self.vision_repo_id:

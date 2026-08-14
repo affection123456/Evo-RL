@@ -20,6 +20,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.policies.ee_action_contract import make_ee_action_contract
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
@@ -43,12 +44,20 @@ class PI05Config(PreTrainedConfig):
     max_state_dim: int = 32
     max_action_dim: int = 32
 
-    # Historical dual-arm layout:
-    # [left xyz3, left Rot6D6, right xyz3, right Rot6D6, raw tail], then pad/clip.
+    # Shared EE contract. Raw layout is defined in
+    # lerobot.policies.ee_action_contract. The model receives only selected arms
+    # and the first N gripper channels, padded to max_*_dim.
     use_rot6d: bool = True
+    ee_arm_mode: str = "right"  # left | right | both
+    ee_gripper_dims: int = 1
+    # Robot-facing decoded action width. A2D state is normally 44D and action 34D.
+    ee_raw_action_dim: int = 34
     # Absolute Rot6D by default (matches main pi05; no delta state/action).
     # Set True for pose-only delta vs state (requires matching delta action stats).
     rot6d_delta_action: bool = False
+    # If set, flow-matching loss uses only the first N action channels (padded dims ignored).
+    # When None, defaults to the selected EE contract's physical dimension.
+    loss_action_dim: int | None = None
     ee_state_key: str = "observation.ee_state"
     ee_action_key: str = "observation.ee_actions"
 
@@ -111,15 +120,26 @@ class PI05Config(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        if self.use_rot6d:
-            if self.max_state_dim < 18:
-                raise ValueError(
-                    f"use_rot6d requires max_state_dim >= 18 for dual-arm xyz+rot6d, got {self.max_state_dim}"
-                )
-            if self.max_action_dim < 18:
-                raise ValueError(
-                    f"use_rot6d requires max_action_dim >= 18 for dual-arm xyz+rot6d, got {self.max_action_dim}"
-                )
+        contract = make_ee_action_contract(
+            use_rot6d=self.use_rot6d,
+            arm_mode=self.ee_arm_mode,
+            gripper_dims=self.ee_gripper_dims,
+        )
+        if self.loss_action_dim is None:
+            object.__setattr__(self, "loss_action_dim", contract.physical_dim)
+        if self.max_state_dim < contract.physical_dim:
+            raise ValueError(
+                f"max_state_dim={self.max_state_dim} is smaller than {contract.description}"
+            )
+        if self.max_action_dim < contract.physical_dim:
+            raise ValueError(
+                f"max_action_dim={self.max_action_dim} is smaller than {contract.description}"
+            )
+        if not 0 < int(self.loss_action_dim) <= contract.physical_dim:
+            raise ValueError(
+                f"loss_action_dim must be in [1, physical_dim={contract.physical_dim}], "
+                f"got {self.loss_action_dim}"
+            )
 
         # Validate configuration
         if self.n_action_steps > self.chunk_size:

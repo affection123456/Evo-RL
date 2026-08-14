@@ -1,13 +1,13 @@
-import pytest
 import torch
 
 from lerobot.configs.types import NormalizationMode
+from lerobot.policies.ee_action_contract import EEActionContract, pack_ee_tensor, pad_or_clip_ee
 from lerobot.policies.pi0_dmp.configuration_pi0_dmp import PI0DMPConfig
-from lerobot.policies.pi0_dmp.modeling_pi0_dmp import PI0DMPPytorch
 from lerobot.policies.pi0_dmp.processor_pi0_dmp import (
     PI0DMPRot6DDeltaProcessorStep,
     _quat_pose_to_rot6d,
     _rot6d_pose_to_quat,
+    decode_pi0_dmp_policy_actions,
 )
 from lerobot.processor.converters import create_transition
 from lerobot.processor.core import TransitionKey
@@ -26,27 +26,11 @@ def test_pi0_dmp_defaults_match_pi05_lerobotv3_norm() -> None:
     assert cfg.max_state_dim == 32
     assert cfg.max_action_dim == 32
     assert cfg.rot6d_delta_action is False
+    assert cfg.ee_arm_mode == "right"
+    assert cfg.ee_gripper_dims == 1
+    assert cfg.loss_action_dim == 10
     assert cfg.normalization_mapping["STATE"] == NormalizationMode.QUANTILES
     assert cfg.normalization_mapping["ACTION"] == NormalizationMode.QUANTILES
-
-
-def test_pi0_dmp_rot6d_requires_dual_arm_pose_width() -> None:
-    with pytest.raises(ValueError, match="max_state_dim >= 18"):
-        PI0DMPConfig(use_rot6d=True, max_state_dim=17)
-
-
-def test_pi0_dmp_rejects_disabling_required_rot6d() -> None:
-    with pytest.raises(ValueError, match="requires use_rot6d=True"):
-        PI0DMPConfig(use_rot6d=False)
-
-
-def test_pi0_dmp_flow_noise_covers_all_32_action_dimensions() -> None:
-    model = PI0DMPPytorch.__new__(PI0DMPPytorch)
-    torch.nn.Module.__init__(model)
-    model.config = type("_Cfg", (), {})()
-    torch.manual_seed(0)
-    noise = model.sample_noise((2, 3, 32), torch.device("cpu"))
-    assert torch.count_nonzero(noise[..., 10:]) > 0
 
 
 def test_pi0_dmp_processor_writes_absolute_by_default() -> None:
@@ -67,13 +51,34 @@ def test_pi0_dmp_processor_writes_absolute_by_default() -> None:
             action=action,
         )
     )
-    expected_action = _quat_pose_to_rot6d(action)[..., :32]
-    expected_ref = _quat_pose_to_rot6d(ref_action)[..., :32]
+    contract = EEActionContract(use_rot6d=True, arm_mode="right", gripper_dims=1)
+    expected_action = pad_or_clip_ee(pack_ee_tensor(action, contract), 32)
+    expected_ref = pad_or_clip_ee(pack_ee_tensor(ref_action, contract), 32)
     torch.testing.assert_close(out[TransitionKey.ACTION], expected_action)
     torch.testing.assert_close(
         out[TransitionKey.OBSERVATION]["observation.ref_actions"], expected_ref
     )
     assert out[TransitionKey.OBSERVATION][OBS_STATE].shape[-1] == 32
+
+
+def test_pi0_dmp_decode_preserves_shared_fields_without_copying_state_wrench() -> None:
+    state = _normalized_random_pose(1, 44)[0]
+    state[26:32] = torch.arange(6, dtype=state.dtype)
+    state[32:44] = 1234.0
+    action = _normalized_random_pose(1, 34)
+    contract = EEActionContract(use_rot6d=True, arm_mode="right", gripper_dims=1)
+    packed = pad_or_clip_ee(pack_ee_tensor(action, contract), 32)
+
+    decoded = decode_pi0_dmp_policy_actions(
+        packed,
+        {OBS_STATE: state, "ee_actions": action[0]},
+        PI0DMPConfig(),
+    )
+
+    torch.testing.assert_close(decoded[..., 7:10], action[..., 7:10])
+    torch.testing.assert_close(decoded[..., 20:21], action[..., 20:21])
+    torch.testing.assert_close(decoded[..., 26:32], state[26:32].expand_as(decoded[..., 26:32]))
+    torch.testing.assert_close(decoded[..., 32:34], torch.zeros_like(decoded[..., 32:34]))
 
 
 def _quat_error_deg(actual: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:

@@ -41,6 +41,7 @@ else:
     PaliGemmaForConditionalGeneration = None
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.ee_action_contract import mask_padded_ee
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
@@ -664,13 +665,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
+    def _mask_padded_action_dims(self, x: Tensor) -> Tensor:
+        physical_dim = int(self.config.loss_action_dim or x.shape[-1])
+        return mask_padded_ee(x, physical_dim)
+
     def sample_noise(self, shape, device):
-        return torch.normal(
-            mean=0.0,
-            std=1.0,
-            size=shape,
-            dtype=torch.float32,
-            device=device,
+        return self._mask_padded_action_dims(
+            torch.normal(
+                mean=0.0,
+                std=1.0,
+                size=shape,
+                dtype=torch.float32,
+                device=device,
+            )
         )
 
     def sample_time(self, bsize, device):
@@ -774,8 +781,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss."""
+        actions = self._mask_padded_action_dims(actions)
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
+        else:
+            noise = self._mask_padded_action_dims(noise)
 
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
@@ -871,7 +881,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         dt = -1.0 / num_steps
 
-        x_t = noise
+        x_t = self._mask_padded_action_dims(noise)
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
@@ -900,7 +910,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             else:
                 v_t = denoise_step_partial_call(x_t)
 
-            x_t = x_t + dt * v_t
+            x_t = self._mask_padded_action_dims(x_t + dt * v_t)
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
@@ -1312,7 +1322,10 @@ class PI05Policy(PreTrainedPolicy):
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
+        loss_action_dim = getattr(self.config, "loss_action_dim", None)
+        if loss_action_dim is None:
+            loss_action_dim = original_action_dim
+        losses = losses[:, :, : int(loss_action_dim)]
 
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),

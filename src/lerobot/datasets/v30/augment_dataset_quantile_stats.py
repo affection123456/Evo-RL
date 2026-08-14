@@ -67,14 +67,34 @@ def _matrix_first_two_cols_to_rot6d(matrix: np.ndarray) -> np.ndarray:
     return np.concatenate([matrix[..., :, 0], matrix[..., :, 1]], axis=-1)
 
 
-def _quat_pose_to_rot6d(x: np.ndarray) -> np.ndarray:
-    """Convert dual-arm xyz+quat to [left pose9, right pose9, raw tail]."""
+def _ee_to_contract(
+    x: np.ndarray,
+    *,
+    use_rot6d: bool,
+    arm_mode: str,
+    gripper_dims: int,
+) -> np.ndarray:
+    """NumPy equivalent of ``lerobot.policies.ee_action_contract.pack_ee_tensor``."""
     x = np.asarray(x, dtype=np.float32)
-    if x.shape[-1] < 14:
-        raise ValueError(f"Expected last dim >= 14 for dual-arm xyz+quat layout, got {x.shape}")
-    left = _matrix_first_two_cols_to_rot6d(_quat_to_matrix(x[..., 3:7]))
-    right = _matrix_first_two_cols_to_rot6d(_quat_to_matrix(x[..., 10:14]))
-    return np.concatenate([x[..., :3], left, x[..., 7:10], right, x[..., 14:]], axis=-1)
+    if arm_mode not in {"left", "right", "both"}:
+        raise ValueError(f"ee_arm_mode must be left/right/both, got {arm_mode!r}")
+    if not 1 <= int(gripper_dims) <= 6:
+        raise ValueError(f"ee_gripper_dims must be in [1, 6], got {gripper_dims}")
+    arms = ("left", "right") if arm_mode == "both" else (arm_mode,)
+    layouts = {
+        "left": (slice(0, 3), slice(3, 7), 14),
+        "right": (slice(7, 10), slice(10, 14), 20),
+    }
+    pose_parts = []
+    gripper_parts = []
+    for arm in arms:
+        xyz_slice, quat_slice, grip_start = layouts[arm]
+        rotation = x[..., quat_slice]
+        if use_rot6d:
+            rotation = _matrix_first_two_cols_to_rot6d(_quat_to_matrix(rotation))
+        pose_parts.extend([x[..., xyz_slice], rotation])
+        gripper_parts.append(x[..., grip_start : grip_start + int(gripper_dims)])
+    return np.concatenate([*pose_parts, *gripper_parts], axis=-1)
 
 
 def _pad_or_clip_last_dim(x: np.ndarray, dim: int) -> np.ndarray:
@@ -132,6 +152,9 @@ def process_single_episode(
     pi0_dmp_rot6d_delta: bool = False,
     pi05_rot6d_stats: bool = False,
     pi05_rot6d_delta: bool = False,
+    ee_use_rot6d: bool = True,
+    ee_arm_mode: str = "right",
+    ee_gripper_dims: int = 1,
     rot6d_state_dim: int = 32,
     rot6d_action_dim: int = 32,
 ) -> dict:
@@ -168,7 +191,12 @@ def process_single_episode(
 
         if state is not None:
             state_rot6d = _pad_or_clip_last_dim(
-                _quat_pose_to_rot6d(state),
+                _ee_to_contract(
+                    state,
+                    use_rot6d=ee_use_rot6d,
+                    arm_mode=ee_arm_mode,
+                    gripper_dims=ee_gripper_dims,
+                ),
                 rot6d_state_dim,
             )
             ep_stats["observation.state"] = get_feature_stats(
@@ -176,25 +204,40 @@ def process_single_episode(
             )
         if ref_state is not None:
             ref_state_rot6d = _pad_or_clip_last_dim(
-                _quat_pose_to_rot6d(ref_state),
+                _ee_to_contract(
+                    ref_state,
+                    use_rot6d=ee_use_rot6d,
+                    arm_mode=ee_arm_mode,
+                    gripper_dims=ee_gripper_dims,
+                ),
                 rot6d_state_dim,
             )
             ep_stats["observation.reference.state"] = get_feature_stats(
                 ref_state_rot6d, axis=0, keepdims=False, quantile_list=DEFAULT_QUANTILES
             )
         # Absolute Rot6D by default; optional pose-only delta (first 18 dims).
-        pose_delta_dims = 18
+        _pose_delta_dims = (9 if ee_use_rot6d else 7) * (2 if ee_arm_mode == "both" else 1)
         if actions is not None:
             actions_rot6d = _pad_or_clip_last_dim(
-                _quat_pose_to_rot6d(actions),
+                _ee_to_contract(
+                    actions,
+                    use_rot6d=ee_use_rot6d,
+                    arm_mode=ee_arm_mode,
+                    gripper_dims=ee_gripper_dims,
+                ),
                 rot6d_action_dim,
             )
             if pi0_dmp_rot6d_delta and state is not None:
                 state_rot6d = _pad_or_clip_last_dim(
-                    _quat_pose_to_rot6d(state),
+                    _ee_to_contract(
+                        state,
+                        use_rot6d=ee_use_rot6d,
+                        arm_mode=ee_arm_mode,
+                        gripper_dims=ee_gripper_dims,
+                    ),
                     rot6d_state_dim,
                 )
-                dims = min(pose_delta_dims, rot6d_action_dim, rot6d_state_dim)
+                dims = min(_pose_delta_dims, rot6d_action_dim, rot6d_state_dim)
                 actions_rot6d = actions_rot6d.copy()
                 actions_rot6d[..., :dims] -= state_rot6d[:, None, :dims]
             ep_stats["action"] = get_feature_stats(
@@ -202,15 +245,25 @@ def process_single_episode(
             )
         if ref_actions is not None:
             ref_actions_rot6d = _pad_or_clip_last_dim(
-                _quat_pose_to_rot6d(ref_actions),
+                _ee_to_contract(
+                    ref_actions,
+                    use_rot6d=ee_use_rot6d,
+                    arm_mode=ee_arm_mode,
+                    gripper_dims=ee_gripper_dims,
+                ),
                 rot6d_action_dim,
             )
             if pi0_dmp_rot6d_delta and ref_state is not None:
                 ref_state_rot6d = _pad_or_clip_last_dim(
-                    _quat_pose_to_rot6d(ref_state),
+                    _ee_to_contract(
+                        ref_state,
+                        use_rot6d=ee_use_rot6d,
+                        arm_mode=ee_arm_mode,
+                        gripper_dims=ee_gripper_dims,
+                    ),
                     rot6d_state_dim,
                 )
-                dims = min(pose_delta_dims, rot6d_action_dim, rot6d_state_dim)
+                dims = min(_pose_delta_dims, rot6d_action_dim, rot6d_state_dim)
                 ref_actions_rot6d = ref_actions_rot6d.copy()
                 ref_actions_rot6d[..., :dims] -= ref_state_rot6d[:, None, :dims]
             ep_stats["observation.ref_actions"] = get_feature_stats(
@@ -226,17 +279,25 @@ def process_single_episode(
         if actions is None:
             actions = _feature_array(batch, "ee_actions")
 
-        pose_delta_dims = 18
+        def to_rot6d(arr: np.ndarray) -> np.ndarray:
+            return _ee_to_contract(
+                arr,
+                use_rot6d=ee_use_rot6d,
+                arm_mode=ee_arm_mode,
+                gripper_dims=ee_gripper_dims,
+            )
+
+        pose_delta_dims = (9 if ee_use_rot6d else 7) * (2 if ee_arm_mode == "both" else 1)
         if state is not None:
-            state_rot6d = _pad_or_clip_last_dim(_quat_pose_to_rot6d(state), rot6d_state_dim)
+            state_rot6d = _pad_or_clip_last_dim(to_rot6d(state), rot6d_state_dim)
             ep_stats["observation.state"] = get_feature_stats(
                 state_rot6d, axis=0, keepdims=False, quantile_list=DEFAULT_QUANTILES
             )
         # Absolute Rot6D by default; optional pose-only delta.
         if actions is not None:
-            actions_rot6d = _pad_or_clip_last_dim(_quat_pose_to_rot6d(actions), rot6d_action_dim)
+            actions_rot6d = _pad_or_clip_last_dim(to_rot6d(actions), rot6d_action_dim)
             if pi05_rot6d_delta and state is not None:
-                state_rot6d = _pad_or_clip_last_dim(_quat_pose_to_rot6d(state), rot6d_state_dim)
+                state_rot6d = _pad_or_clip_last_dim(to_rot6d(state), rot6d_state_dim)
                 dims = min(pose_delta_dims, rot6d_action_dim, rot6d_state_dim)
                 actions_rot6d = _subtract_state_delta(actions_rot6d, state_rot6d, dims)
             ep_stats["action"] = get_feature_stats(
@@ -253,6 +314,9 @@ def compute_quantile_stats_for_dataset(
     pi0_dmp_rot6d_delta: bool = False,
     pi05_rot6d_stats: bool = False,
     pi05_rot6d_delta: bool = False,
+    ee_use_rot6d: bool = True,
+    ee_arm_mode: str = "right",
+    ee_gripper_dims: int = 1,
     rot6d_state_dim: int = 32,
     rot6d_action_dim: int = 32,
 ) -> dict[str, dict]:
@@ -287,6 +351,9 @@ def compute_quantile_stats_for_dataset(
                     pi0_dmp_rot6d_delta=pi0_dmp_rot6d_delta,
                     pi05_rot6d_stats=pi05_rot6d_stats,
                     pi05_rot6d_delta=pi05_rot6d_delta,
+                    ee_use_rot6d=ee_use_rot6d,
+                    ee_arm_mode=ee_arm_mode,
+                    ee_gripper_dims=ee_gripper_dims,
                     rot6d_state_dim=rot6d_state_dim,
                     rot6d_action_dim=rot6d_action_dim,
                 )
@@ -302,6 +369,9 @@ def compute_quantile_stats_for_dataset(
                     pi0_dmp_rot6d_delta=pi0_dmp_rot6d_delta,
                     pi05_rot6d_stats=pi05_rot6d_stats,
                     pi05_rot6d_delta=pi05_rot6d_delta,
+                    ee_use_rot6d=ee_use_rot6d,
+                    ee_arm_mode=ee_arm_mode,
+                    ee_gripper_dims=ee_gripper_dims,
                     rot6d_state_dim=rot6d_state_dim,
                     rot6d_action_dim=rot6d_action_dim,
                 ): episode_idx
@@ -335,6 +405,9 @@ def augment_dataset_with_quantile_stats(
     pi0_dmp_rot6d_delta: bool = False,
     pi05_rot6d_stats: bool = False,
     pi05_rot6d_delta: bool = False,
+    ee_use_rot6d: bool = True,
+    ee_arm_mode: str = "right",
+    ee_gripper_dims: int = 1,
     rot6d_state_dim: int = 32,
     rot6d_action_dim: int = 32,
 ) -> None:
@@ -376,6 +449,9 @@ def augment_dataset_with_quantile_stats(
         pi0_dmp_rot6d_delta=pi0_dmp_rot6d_delta,
         pi05_rot6d_stats=pi05_rot6d_stats,
         pi05_rot6d_delta=pi05_rot6d_delta,
+        ee_use_rot6d=ee_use_rot6d,
+        ee_arm_mode=ee_arm_mode,
+        ee_gripper_dims=ee_gripper_dims,
         rot6d_state_dim=rot6d_state_dim,
         rot6d_action_dim=rot6d_action_dim,
     )
@@ -450,6 +526,24 @@ def main():
         action="store_true",
         help="With --pi05-rot6d-stats, write pose-only delta action stats instead of absolute.",
     )
+    parser.add_argument(
+        "--ee-use-rot6d",
+        choices=("true", "false"),
+        default="true",
+        help="Shared EE contract rotation: true => xyz+rot6d, false => xyz+quaternion.",
+    )
+    parser.add_argument(
+        "--ee-arm-mode",
+        choices=("left", "right", "both"),
+        default="right",
+        help="Selected arm(s) for model-facing state/action stats (default: right).",
+    )
+    parser.add_argument(
+        "--ee-gripper-dims",
+        type=int,
+        default=1,
+        help="Keep the first N gripper/dexterous-hand channels per selected arm (default: 1).",
+    )
     parser.add_argument("--rot6d-state-dim", type=int, default=32)
     parser.add_argument("--rot6d-action-dim", type=int, default=32)
 
@@ -467,6 +561,9 @@ def main():
         pi0_dmp_rot6d_delta=args.pi0_dmp_rot6d_delta,
         pi05_rot6d_stats=args.pi05_rot6d_stats,
         pi05_rot6d_delta=args.pi05_rot6d_delta,
+        ee_use_rot6d=args.ee_use_rot6d == "true",
+        ee_arm_mode=args.ee_arm_mode,
+        ee_gripper_dims=args.ee_gripper_dims,
         rot6d_state_dim=args.rot6d_state_dim,
         rot6d_action_dim=args.rot6d_action_dim,
     )

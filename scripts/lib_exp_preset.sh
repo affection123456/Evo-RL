@@ -5,9 +5,10 @@
 #   pi05_data_dmp       — POLICY_TYPE=pi05
 #   pi0_dmp_data_dmp    — POLICY_TYPE=pi0_dmp
 #
-# All three share verified pi05_data_lerobotv3 defaults:
-#   dual-arm xyz+Rot6D pose followed by the raw tail, absolute + QUANTILES.
-#   The converted vector is clipped/padded to 32 dimensions.
+# All three share verified pi05_data_lerobotv3 norm defaults:
+#   right EE xyz+rotation+gripper_first(1), absolute + QUANTILES + pad32.
+#   --ee-use-rot6d=true  => 3+6+1 = 10 physical dims (default)
+#   --ee-use-rot6d=false => 3+4+1 = 8 physical dims
 #
 # Default PRESET=pi05_data_lerobotv3 for all scripts (override via --preset=).
 #
@@ -94,6 +95,9 @@ evo_rl_parse_script_args() {
         || _evo_rl_try_opt CHECKPOINT_PATH --checkpoint_path \
         || _evo_rl_try_opt NUM_INFERENCE_STEPS --num-inference-steps \
         || _evo_rl_try_opt NUM_INFERENCE_STEPS --num_inference_steps \
+        || _evo_rl_try_opt EE_USE_ROT6D --ee-use-rot6d \
+        || _evo_rl_try_opt EE_ARM_MODE --ee-arm-mode \
+        || _evo_rl_try_opt EE_GRIPPER_DIMS --ee-gripper-dims \
         || _evo_rl_try_opt NORMALIZE_EE_GRIPPER --normalize-ee-gripper \
         || _evo_rl_try_opt NORMALIZE_EE_GRIPPER --normalize_ee_gripper \
         || _evo_rl_try_opt RUN_DATASET_REPORT --run-dataset-report
@@ -116,6 +120,9 @@ evo_rl_apply_preset() {
   export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-/mnt/nas/datasets/rldata/lerobot}"
   : "${USR_NAME:=wanghao}"
   : "${MODEL_ZOO:=/mnt/data/modelzoo}"
+  : "${EE_USE_ROT6D:=true}"
+  : "${EE_ARM_MODE:=right}"
+  : "${EE_GRIPPER_DIMS:=1}"
 
   case "${PRESET}" in
     pi0_dmp_data_dmp)
@@ -141,7 +148,7 @@ evo_rl_apply_preset() {
 
   echo "[preset] PRESET=${PRESET} POLICY_TYPE=${POLICY_TYPE}"
   echo "[preset] HF_LEROBOT_HOME=${HF_LEROBOT_HOME}"
-  echo "[preset] EE layout: dual-arm full32 Rot6D"
+  echo "[preset] EE contract: arm=${EE_ARM_MODE} use_rot6d=${EE_USE_ROT6D} gripper_dims=${EE_GRIPPER_DIMS}"
   if [[ -n "${DATASET_REPO_ID:-}" ]]; then
     echo "[preset] DATASET_REPO_ID=${DATASET_REPO_ID}"
     echo "[preset] DATASET_ROOT=${DATASET_ROOT}"

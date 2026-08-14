@@ -68,6 +68,12 @@ src/lerobot/datasets/convert_local_lerobot_v21_to_v30.py
 
 ## 3. 原始 EE state/action 布局
 
+统一定义位于：
+
+```text
+src/lerobot/policies/ee_action_contract.py
+```
+
 原始 A2D EE 向量前 26 维：
 
 ```text
@@ -101,16 +107,44 @@ stats/preprocessor 中完成。
 夹爪数据应处于 `[0,1]`。prepare 默认会检查 `[14:26]`，原始
 `[0,1000]` 数据会除以 1000；已经处于 `[0,1]` 的数据不会重复缩放。
 
-## 4. 模型侧 full32 EE 布局
+## 4. 模型侧统一 EE 合同
 
-PI05、PI0-DMP 和 Pistar06 使用同一历史双臂 Rot6D 顺序：
+三条训练链路共用以下参数：
 
 ```text
-left_xyz(3), left_Rot6D(6), right_xyz(3), right_Rot6D(6), raw_tail
+--ee-use-rot6d=true|false
+--ee-arm-mode=left|right|both
+--ee-gripper-dims=N
 ```
 
-转换后统一 clip/pad 到 32D；pose delta 仅作用于前 18 维，raw tail 保持绝对值。
-PI05 和 PI0-DMP 的 flow loss 覆盖全部 32 维。
+默认：
+
+```text
+use_rot6d=true
+arm_mode=right
+gripper_dims=1
+```
+
+因此默认有效物理维度为：
+
+```text
+右臂 xyz(3) + Rot6D(6) + 右夹爪第一个通道(1) = 10D
+```
+
+关闭 Rot6D 时：
+
+```text
+右臂 xyz(3) + quaternion(4) + 右夹爪第一个通道(1) = 8D
+```
+
+模型 head 仍 pad 到 32D，但 PI05 和 PI0-DMP 的 flow loss 只计算有效物理维，
+不计算 padding。Pistar06 value 使用同一 state 合同。
+
+`arm_mode=both` 时模型侧顺序为：
+
+```text
+left_pose, right_pose, left_gripper[:N], right_gripper[:N]
+```
 
 Rot6D 使用旋转矩阵前两列：
 
@@ -120,10 +154,18 @@ rot6d = [R[:,0], R[:,1]]
 
 推理 decode 通过 Gram-Schmidt 恢复旋转矩阵，再转回 xyzw quaternion。
 
-### 4.1 Stats 必须与训练布局一致
+### 4.1 Stats 必须与训练合同一致
 
-prepare stats 使用相同的双臂 full32 转换和前 18 维 pose delta。改变
-delta/absolute 模式后必须重新 augment stats，并使用新 run 名训练。
+prepare 和 train 必须传相同的：
+
+```text
+--ee-use-rot6d
+--ee-arm-mode
+--ee-gripper-dims
+```
+
+改变任何一项后必须重新 augment stats，并使用新 run 名训练。不能把
+right10 stats 用于 dual-arm 模型，也不能把 Rot6D stats 用于 quaternion 8D。
 
 ## 5. 数据准备
 
@@ -144,7 +186,7 @@ bash scripts/run_lerobot_dataset_prepare.sh \
 默认执行：
 
 ```text
-convert/merge → gripper normalize → dual-arm full32 Rot6D stats → dataset report
+convert/merge → gripper normalize → right10 quantile stats → dataset report
 ```
 
 ### 5.2 仅重新计算 magazine shelf stats
@@ -152,6 +194,14 @@ convert/merge → gripper normalize → dual-arm full32 Rot6D stats → dataset 
 ```bash
 bash scripts/run_lerobot_dataset_prepare.sh augment \
   --dataset-repo-id=magazine_shelf_pick_20260807_0
+```
+
+使用 quaternion 8D 合同：
+
+```bash
+bash scripts/run_lerobot_dataset_prepare.sh augment \
+  --dataset-repo-id=magazine_shelf_pick_20260807_0 \
+  --ee-use-rot6d=false
 ```
 
 关闭夹爪尺度处理：
@@ -210,8 +260,8 @@ observation.ref_actions
 absolute action
 QUANTILES
 pad32
-left xyz+Rot6D, right xyz+Rot6D, raw tail
-pose delta（如启用）仅作用于前 18 维
+right arm + gripper first channel
+Rot6D（可关闭）
 ```
 
 ## 7. Value 训练与推理
@@ -259,7 +309,7 @@ bash scripts/run_valuefunc_infer.sh 0731_pi0_dmp \
 
 ## 8. Policy 训练
 
-PI05 + magazine shelf，默认双臂 full32 Rot6D：
+PI05 + magazine shelf，默认 right10：
 
 ```bash
 bash scripts/run_policy_train.sh 0813_pi05_magazine_shelf_right \
@@ -283,6 +333,18 @@ bash scripts/run_policy_train.sh 0731_pi0_dmp \
   --preset=pi0_dmp_data_dmp \
   --hf-lerobot-home=/mnt/nas/datasets/rldata/lerobot_with_ref \
   --dataset-repo-id=dmp_data_recap/unt_merged_Mz_right_pik_DMP_lerobot
+```
+
+显式 quaternion 8D：
+
+```text
+--ee-use-rot6d=false
+```
+
+选择双臂、每只手第一维：
+
+```text
+--ee-arm-mode=both --ee-gripper-dims=1
 ```
 
 训练脚本发现同名 `outputs/train/<RUN_NAME>` 时会删除后重新训练，因此正式实验必须
@@ -334,7 +396,8 @@ bash scripts/run_policy_infer_openpi_bridge.sh RUN_NAME \
   --preset=pi0_dmp_data_dmp
 ```
 
-推理从 checkpoint 加载 Rot6D 配置。不要在部署时覆盖训练时的表示设置。
+推理从 checkpoint 加载 EE 合同。不要在部署时把 checkpoint 的
+`use_rot6d/arm_mode/gripper_dims` 改成与训练不同的值。
 
 ### 10.2 PI05 输入
 
@@ -347,8 +410,14 @@ observation/right_wrist_image  → observation.images.hand_right
 observation/left_wrist_image   → observation.images.hand_left（可选）
 ```
 
-客户端发送至少 14D 的完整双臂 raw quaternion EE state。模型输入按历史顺序转换为
-`left xyz+Rot6D, right xyz+Rot6D, raw tail` 后 clip/pad32；输出再恢复为 raw quaternion action。
+客户端发送完整 raw quaternion EE state。默认 right10 合同要求至少 21 维，因为
+需要读取右臂 `[7:14]` 和右夹爪第一维 `[20]`。
+
+bridge 保留完整 raw state 作为 decode 模板，但模型实际只接收合同选择后的
+8D/10D，再 pad32。输出恢复为 34D raw quaternion action：
+
+- 选中臂和选中夹爪通道来自模型预测。
+- 未选中臂、其余夹爪通道和 extras 从当前 state 模板复制。
 
 ### 10.3 PI0-DMP 输入
 
@@ -374,7 +443,7 @@ observation.images.ref_top_head
 observation.images.ref_hand_right
 ```
 
-PI0-DMP 当前/参考 state、当前/参考 action 均使用同一个双臂 full32 Rot6D 布局。
+PI0-DMP 当前/参考 state、当前/参考 action 均使用同一个 EE 合同。
 
 ### 10.4 服务自检日志
 
@@ -382,15 +451,15 @@ PI0-DMP 当前/参考 state、当前/参考 action 均使用同一个双臂 full
 
 ```text
 First OpenPI observation after rename ...
-Model-facing EE layout: dual-arm xyz+Rot6D pose plus raw tail, clip/pad32 ...
+Model-facing EE contract: right: xyz(3)+rot6d(6)+gripper_first(1); physical_dim=10
 ```
 
 常见错误：
 
 - `Missing observation.ee_state`：PI05 rename_map 错误，state 被映射到了
   `observation.state`。
-- `D>=14`：客户端没有发送完整双臂 xyz+quaternion raw EE state。
-- action/姿态离谱：优先核对 checkpoint 与 stats 的 full32 布局、夹爪尺度和 quat 顺序。
+- `D>=21`：客户端没有发送完整到右夹爪首维的 raw EE state。
+- action/姿态离谱：优先核对 checkpoint 合同、stats 合同、夹爪尺度和 quat 顺序。
 - reference 字段缺失：当前 checkpoint 实际是 PI0-DMP。
 
 ## 11. 推理性能与安全默认
@@ -430,14 +499,14 @@ C: 5 steps，cache off
 
 ## 12. 旧 checkpoint
 
-`outputs/train/0721_1` 等旧 PI0-DMP checkpoint 使用 34D delta processor，
-不等同于当前 full32 absolute 配置。
+`outputs/train/0721_1` 等旧 PI0-DMP checkpoint 使用历史 34D、dual-arm、delta
+processor，不等同于当前默认 right10 absolute 合同。
 
 部署旧 checkpoint 时：
 
 - 使用 checkpoint 自带 config/preprocessor/stats。
-- 不要用当前默认参数覆盖其处理器配置。
-- 不要把旧 34D stats 与当前 full32 训练混用。
+- 不要用当前默认参数覆盖其合同。
+- 不要把旧 34D stats 与当前 right10 训练混用。
 - 若 Rot6D 编码来自标准列布局修复之前，需要重算 stats 并重训，不能只改 decode。
 
 新实验建议使用新 run 名和当前统一合同重新 augment、训练。
@@ -475,6 +544,7 @@ scripts/run_valuefunc_infer.sh
 scripts/run_policy_train.sh
 scripts/run_policy_infer_openpi_bridge.sh
 
+src/lerobot/policies/ee_action_contract.py
 src/lerobot/policies/pi05/processor_pi05.py
 src/lerobot/policies/pi0_dmp/processor_pi0_dmp.py
 src/lerobot/values/pistar06/processor_pistar06.py
@@ -493,13 +563,13 @@ src/lerobot/scripts/lerobot_policy_infer_openpi_bridge.py
 
 训练前：
 
-- `meta/stats.json` 已按当前 full32 布局重算。
-- value 和 policy 使用相同的双臂 Rot6D 布局。
+- `meta/stats.json` 已按当前合同重算。
+- value 和 policy 使用相同 arm/rotation/gripper 选择。
 - 新实验使用新的 run 名。
 
 部署前：
 
 - checkpoint 类型和 PRESET 一致。
-- 客户端发送完整双臂 raw quaternion EE state。
+- 客户端发送 raw quaternion EE state，不发送预先切好的 right10。
 - PI05 不要求 reference；PI0-DMP 必须提供 reference。
 - 默认 10 个去噪步骤且关闭实验 KV-cache。
