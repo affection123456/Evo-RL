@@ -9,6 +9,9 @@ set -euo pipefail
 RUN_NAME="${1:?Usage: bash scripts/run_policy_train.sh RUN_NAME --dataset-repo-id=org/name [options]}"
 shift
 
+export SWANLAB_API_KEY="qBi2vNBnGXoH04ErnxlUp"  # 可留空；如你不用 SwanLab 可忽略
+export USR_NAME="wanghao"  # 用户名
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib_exp_preset.sh
 source "${SCRIPT_DIR}/lib_exp_preset.sh"
@@ -20,7 +23,6 @@ if [[ -z "${DATASET_REPO_ID:-}" ]]; then
   exit 1
 fi
 
-USR_NAME="${USR_NAME:-wanghao}"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 PYTHON="${PYTHON:-/mnt/data/miniconda3/envs/evo-rl_${USR_NAME}/bin/python}"
