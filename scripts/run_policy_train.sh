@@ -65,6 +65,9 @@ if [[ -n "${POLICY_PRETRAINED_PATH}" ]]; then
   POLICY_ARGS+=("--policy.pretrained_path=${POLICY_PRETRAINED_PATH}")
 fi
 PI05_RENAME_MAP='{"ee_state":"observation.state","observation.ee_state":"observation.state","ee_actions":"action","observation.ee_actions":"action","top_head":"observation.images.top_head","hand_right":"observation.images.hand_right","hand_left":"observation.images.hand_left"}'
+echo "[pi05-raw32] state: ee_state[:32] -> observation.state (MIN_MAX)"
+echo "[pi05-raw32] action: ee_actions[:, :32] -> action, chunk=50 (MEAN_STD)"
+echo "[pi05-raw32] images: top_head/hand_left/hand_right -> observation.images.* (IDENTITY)"
 
 if [[ -d "${OUTPUT_DIR}" ]]; then
   echo "Output dir exists, removing: ${OUTPUT_DIR}"

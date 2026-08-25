@@ -24,7 +24,7 @@ import torch
 from typing_extensions import Unpack
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import FeatureType
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.envs.configs import EnvConfig
@@ -54,6 +54,8 @@ from lerobot.processor.converters import (
 )
 from lerobot.utils.constants import (
     ACTION,
+    OBS_IMAGES,
+    OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
@@ -249,6 +251,12 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        preprocessor_to_transition = batch_to_transition
+        if isinstance(policy_cfg, PI05Config):
+            from lerobot.policies.pi05.processor_pi05 import pi05_raw32_batch_to_transition
+
+            preprocessor_to_transition = pi05_raw32_batch_to_transition
+
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
@@ -277,7 +285,7 @@ def make_pre_post_processors(
                     "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
                 ),
                 overrides=kwargs.get("preprocessor_overrides", {}),
-                to_transition=batch_to_transition,
+                to_transition=preprocessor_to_transition,
                 to_output=transition_to_batch,
             ),
             PolicyProcessorPipeline.from_pretrained(
@@ -418,6 +426,59 @@ def make_pre_post_processors(
     return processors
 
 
+def _resolve_pi05_raw32_source(
+    ds_meta: LeRobotDatasetMetadata,
+    rename_map: dict[str, str],
+    canonical_key: str,
+) -> str:
+    candidates = [
+        key for key in ds_meta.features if rename_map.get(key, key) == canonical_key
+    ]
+    if len(candidates) != 1:
+        raise ValueError(
+            f"PI05 raw32 requires exactly one dataset key mapped to {canonical_key!r}; "
+            f"found {candidates or 'none'}"
+        )
+    source = candidates[0]
+    source_dim = int(ds_meta.features[source]["shape"][-1])
+    if source_dim < 32:
+        raise ValueError(
+            f"PI05 raw32 source {source!r} must have at least 32 channels, got {source_dim}"
+        )
+    return source
+
+
+def make_pi05_raw32_features(
+    ds_meta: LeRobotDatasetMetadata,
+    rename_map: dict[str, str] | None,
+) -> tuple[dict[str, PolicyFeature], dict[str, PolicyFeature]]:
+    """Build the canonical PI05 raw dual-arm quaternion 32D feature contract."""
+    rename_map = rename_map or {}
+    _resolve_pi05_raw32_source(ds_meta, rename_map, OBS_STATE)
+    _resolve_pi05_raw32_source(ds_meta, rename_map, ACTION)
+
+    dataset_features = dataset_to_policy_features(ds_meta.features)
+    visual_features: dict[str, PolicyFeature] = {}
+    for source, feature in dataset_features.items():
+        if feature.type is not FeatureType.VISUAL:
+            continue
+        target = rename_map.get(source, source)
+        if not target.startswith(f"{OBS_IMAGES}."):
+            continue
+        if target in visual_features:
+            raise ValueError(f"Multiple PI05 image keys map to {target!r}")
+        visual_features[target] = feature
+    if not visual_features:
+        raise ValueError("PI05 raw32 requires at least one observation.images.* feature")
+
+    inputs = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(32,)),
+        **visual_features,
+    }
+    outputs = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(32,))}
+    return inputs, outputs
+
+
 def make_policy(
     cfg: PreTrainedConfig,
     ds_meta: LeRobotDatasetMetadata | None = None,
@@ -482,9 +543,12 @@ def make_policy(
             raise ValueError("env_cfg cannot be None when ds_meta is not provided")
         features = env_to_policy_features(env_cfg)
 
-    cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    if not cfg.input_features:
-        cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+    if isinstance(cfg, PI05Config) and ds_meta is not None:
+        cfg.input_features, cfg.output_features = make_pi05_raw32_features(ds_meta, rename_map)
+    else:
+        cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+        if not cfg.input_features:
+            cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
     kwargs["config"] = cfg
 
     # Pass dataset_stats to the policy if available (needed for some policies like SARM)

@@ -53,19 +53,25 @@ class TrackingTokenizer:
 
 def _make_pi05_preprocessor():
     cfg = PI05Config(
-        max_state_dim=4,
-        max_action_dim=2,
+        max_state_dim=32,
+        max_action_dim=32,
         dtype="float32",
         device="cpu",
     )
     cfg.input_features = {
-        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(4,)),
+        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(32,)),
     }
     cfg.output_features = {
-        "action": PolicyFeature(type=FeatureType.ACTION, shape=(2,)),
+        "action": PolicyFeature(type=FeatureType.ACTION, shape=(32,)),
     }
     preprocessor, _ = make_pi05_pre_post_processors(config=cfg, dataset_stats=None)
     return preprocessor
+
+
+def _raw32_state(batch_size: int) -> torch.Tensor:
+    state = torch.zeros(batch_size, 32, dtype=torch.float32)
+    state[:, :4] = torch.tensor([0.1, -0.2, 0.0, 0.3])
+    return state
 
 
 @require_package("transformers")
@@ -84,13 +90,7 @@ def test_acp_prompt_reaches_pi05_tokenizer(mock_auto_tokenizer):
         seed=123,
     )
     batch = {
-        "observation.state": torch.tensor(
-            [
-                [0.1, -0.2, 0.0, 0.3],
-                [-0.4, 0.5, -0.6, 0.7],
-            ],
-            dtype=torch.float32,
-        ),
+        "observation.state": _raw32_state(2),
         "task": ["Pick bottle", "Place bottle"],
         "complementary_info.acp_indicator": torch.tensor([1, 0], dtype=torch.int64),
     }
@@ -117,10 +117,7 @@ def test_without_acp_no_advantage_tag_in_pi05_tokenizer(mock_auto_tokenizer):
 
     preprocessor = _make_pi05_preprocessor()
     batch = {
-        "observation.state": torch.tensor(
-            [[0.0, 0.1, -0.1, 0.2]],
-            dtype=torch.float32,
-        ),
+        "observation.state": _raw32_state(1),
         "task": ["Pick bottle"],
     }
     _ = preprocessor(batch)

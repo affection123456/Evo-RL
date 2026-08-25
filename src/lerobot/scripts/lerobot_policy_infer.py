@@ -156,7 +156,8 @@ def _decode_observation_payload(
         val = obs_in[client_key]
         is_visual = ft.type == FeatureType.VISUAL or "image" in policy_key or "image" in client_key
         if is_visual:
-            out[client_key] = np.ascontiguousarray(_decode_image_value(val))
+            image = _decode_image_value(val)
+            out[client_key] = np.ascontiguousarray(image.transpose(2, 0, 1))
         elif ft.type == FeatureType.LANGUAGE:
             out[client_key] = _decode_numeric_or_token_list(val, as_language=True)
         elif isinstance(val, list):

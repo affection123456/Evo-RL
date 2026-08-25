@@ -282,11 +282,23 @@ def train(
     accelerator.wait_for_everyone()
 
     # Create processors - only provide dataset_stats if not resuming from saved processors
+    processor_stats = dataset.meta.stats
+    if cfg.policy.type == "pi05":
+        from lerobot.policies.pi05.processor_pi05 import make_pi05_raw32_stats
+
+        processor_stats = make_pi05_raw32_stats(dataset.meta.stats)
+        logging.info(
+            "PI05 raw32 contract: ee_state[:32] -> observation.state, "
+            "ee_actions[:, :32] -> action; chunk=%d; normalization=%s",
+            cfg.policy.chunk_size,
+            cfg.policy.normalization_mapping,
+        )
+
     processor_kwargs = {}
     postprocessor_kwargs = {}
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
-        processor_kwargs["dataset_stats"] = dataset.meta.stats
+        processor_kwargs["dataset_stats"] = processor_stats
 
     # For SARM, always provide dataset_meta for progress normalization
     if cfg.policy.type == "sarm":
@@ -296,9 +308,9 @@ def train(
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": processor_stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
-                # "norm_map": policy.config.normalization_mapping,
+                "norm_map": policy.config.normalization_mapping,
             },
         }
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
@@ -306,9 +318,9 @@ def train(
         }
         postprocessor_kwargs["postprocessor_overrides"] = {
             "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": processor_stats,
                 "features": policy.config.output_features,
-                # "norm_map": policy.config.normalization_mapping,
+                "norm_map": policy.config.normalization_mapping,
             },
         }
 
