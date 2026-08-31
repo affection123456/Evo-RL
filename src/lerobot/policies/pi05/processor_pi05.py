@@ -36,13 +36,68 @@ from lerobot.processor import (
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
 )
-from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+from lerobot.processor.converters import (
+    batch_to_transition,
+    policy_action_to_transition,
+    transition_to_batch,
+    transition_to_policy_action,
+)
 from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
+    ACTION,
+    OBS_IMAGES,
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+
+
+PI05_RAW32_DIM = 32
+PI05_STATE_ALIASES = (OBS_STATE, "ee_state", "observation.ee_state")
+PI05_ACTION_ALIASES = (ACTION, "ee_actions", "observation.ee_actions")
+PI05_IMAGE_ALIASES = {
+    f"{OBS_IMAGES}.top_head": (f"{OBS_IMAGES}.top_head", "top_head"),
+    f"{OBS_IMAGES}.hand_left": (f"{OBS_IMAGES}.hand_left", "hand_left"),
+    f"{OBS_IMAGES}.hand_right": (f"{OBS_IMAGES}.hand_right", "hand_right"),
+}
+
+
+def _first_present(mapping: dict[str, Any], aliases: tuple[str, ...]) -> Any | None:
+    for key in aliases:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
+
+
+def _require_raw32(value: Any, name: str) -> torch.Tensor:
+    tensor = torch.as_tensor(value)
+    if tensor.shape[-1] < PI05_RAW32_DIM:
+        raise ValueError(
+            f"PI05 raw32 {name} requires at least {PI05_RAW32_DIM} channels, "
+            f"got shape={tuple(tensor.shape)}"
+        )
+    return tensor[..., :PI05_RAW32_DIM]
+
+
+def pi05_raw32_batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
+    """Convert bare LeRobot v3 EE keys into the canonical PI05 raw32 contract."""
+    transition = batch_to_transition(batch)
+    raw_state = _first_present(batch, PI05_STATE_ALIASES)
+    if raw_state is None:
+        raise KeyError(f"PI05 raw32 state is missing; expected one of {PI05_STATE_ALIASES}")
+
+    observation = {OBS_STATE: _require_raw32(raw_state, "state")}
+    for canonical_key, aliases in PI05_IMAGE_ALIASES.items():
+        image = _first_present(batch, aliases)
+        if image is not None:
+            observation[canonical_key] = image
+
+    raw_action = _first_present(batch, PI05_ACTION_ALIASES)
+    transition[TransitionKey.OBSERVATION] = observation
+    transition[TransitionKey.ACTION] = (
+        None if raw_action is None else _require_raw32(raw_action, "action")
+    )
+    return transition
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -161,6 +216,8 @@ def make_pi05_pre_post_processors(
         PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
             steps=input_steps,
             name=POLICY_PREPROCESSOR_DEFAULT_NAME,
+            to_transition=pi05_raw32_batch_to_transition,
+            to_output=transition_to_batch,
         ),
         PolicyProcessorPipeline[PolicyAction, PolicyAction](
             steps=output_steps,

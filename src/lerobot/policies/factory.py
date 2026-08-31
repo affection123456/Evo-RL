@@ -249,6 +249,12 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        preprocessor_to_transition = batch_to_transition
+        if isinstance(policy_cfg, PI05Config):
+            from lerobot.policies.pi05.processor_pi05 import pi05_raw32_batch_to_transition
+
+            preprocessor_to_transition = pi05_raw32_batch_to_transition
+
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
@@ -277,7 +283,7 @@ def make_pre_post_processors(
                     "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
                 ),
                 overrides=kwargs.get("preprocessor_overrides", {}),
-                to_transition=batch_to_transition,
+                to_transition=preprocessor_to_transition,
                 to_output=transition_to_batch,
             ),
             PolicyProcessorPipeline.from_pretrained(
